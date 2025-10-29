@@ -10,7 +10,7 @@ categories = ["development-tools::testing"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.21"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 anyhow = "1"
 thiserror = "1"
 tempfile = "3"
@@ -19,6 +19,7 @@ serde_json = "1"
 tracing = "0.1"
 which = "8.0.0"
 sysinfo = "0.37.2"
+futures = "0.3.31"
 
 [dev-dependencies]
 testresult = "0.4"

@@ -82,16 +82,87 @@ impl TestNetwork {
 
     /// Check current network connectivity ratio (0.0 to 1.0)
     async fn check_connectivity(&self) -> Result<f64> {
-        // TODO: Implement actual connectivity checking via WebSocket queries
-        // This is the critical part that fixes the FIXME bug in fdev
+        let all_peers: Vec<_> = self.gateways.iter().chain(self.peers.iter()).collect();
+        let total = all_peers.len();
 
-        // For now, return a placeholder
-        // Real implementation needs to:
-        // 1. Connect to each peer via WebSocket
-        // 2. Query for connected peers (NodeQuery::ConnectedPeers)
-        // 3. Calculate connectivity ratio
+        if total == 0 {
+            return Ok(1.0);
+        }
 
-        Ok(1.0) // Placeholder - always reports ready
+        let mut connected_count = 0;
+
+        for peer in &all_peers {
+            match self.query_peer_connections(peer).await {
+                Ok(0) => {
+                    tracing::trace!("{} has no connections (isolated)", peer.id());
+                }
+                Ok(connections) => {
+                    connected_count += 1;
+                    tracing::trace!("{} has {} connections", peer.id(), connections);
+                }
+                Err(e) => {
+                    tracing::debug!("Failed to query {}: {}", peer.id(), e);
+                }
+            }
+        }
+
+        let ratio = connected_count as f64 / total as f64;
+        Ok(ratio)
+    }
+
+    /// Query a single peer for its connection count
+    async fn query_peer_connections(&self, peer: &TestPeer) -> Result<usize> {
+        use tokio_tungstenite::connect_async;
+
+        let url = peer.ws_url();
+        let (ws_stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connect_async(&url)
+        ).await
+            .map_err(|_| Error::ConnectivityFailed(format!("Timeout connecting to {}", url)))?
+            .map_err(|e| Error::ConnectivityFailed(format!("Failed to connect to {}: {}", url, e)))?;
+
+        use futures::stream::StreamExt;
+        use futures::sink::SinkExt;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send ConnectedPeers query
+        let query = serde_json::json!({
+            "NodeQueries": {
+                "ConnectedPeers": {}
+            }
+        });
+
+        let msg = tokio_tungstenite::tungstenite::Message::Text(query.to_string());
+        write.send(msg).await
+            .map_err(|e| Error::ConnectivityFailed(format!("Failed to send query: {}", e)))?;
+
+        // Read response
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read.next()
+        ).await
+            .map_err(|_| Error::ConnectivityFailed("Timeout waiting for response".into()))?
+            .ok_or_else(|| Error::ConnectivityFailed("No response received".into()))?
+            .map_err(|e| Error::ConnectivityFailed(format!("WebSocket error: {}", e)))?;
+
+        // Parse response
+        let text = response.to_text()
+            .map_err(|e| Error::ConnectivityFailed(format!("Invalid response: {}", e)))?;
+
+        let resp: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Error::ConnectivityFailed(format!("JSON parse error: {}", e)))?;
+
+        // Extract peer count from response
+        if let Some(peers) = resp.get("QueryResponse")
+            .and_then(|q| q.get("ConnectedPeers"))
+            .and_then(|c| c.get("peers"))
+            .and_then(|p| p.as_array())
+        {
+            Ok(peers.len())
+        } else {
+            Err(Error::ConnectivityFailed(format!("Unexpected response format: {}", text)))
+        }
     }
 
     /// Get the current network topology

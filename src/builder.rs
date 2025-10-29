@@ -30,7 +30,7 @@ impl NetworkBuilder {
             gateways: 1,
             peers: 3,
             binary: FreenetBinary::default(),
-            min_connectivity: 0.8,
+            min_connectivity: 1.0, // Default: require all peers connected
             connectivity_timeout: Duration::from_secs(30),
         }
     }
