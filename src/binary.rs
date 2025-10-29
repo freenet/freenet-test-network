@@ -80,13 +80,22 @@ fn is_in_freenet_workspace() -> bool {
 }
 
 fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
+    // Get workspace root BEFORE building
+    let workspace_root = std::env::current_dir()?
+        .ancestors()
+        .find(|p| p.join("Cargo.toml").exists())
+        .ok_or_else(|| Error::InvalidBinary("Could not find workspace root".into()))?
+        .to_path_buf();
+
     let profile_arg = match profile {
         BuildProfile::Debug => vec!["build"],
         BuildProfile::Release => vec!["build", "--release"],
     };
 
     let mut cmd = std::process::Command::new("cargo");
-    cmd.args(&profile_arg).args(["--bin", "freenet"]);
+    cmd.args(&profile_arg)
+        .args(["--bin", "freenet"])
+        .current_dir(&workspace_root);
 
     let output = cmd.output()?;
 
@@ -97,7 +106,13 @@ fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
         )));
     }
 
-    let target_dir = get_target_dir()?;
+    // Use workspace_root's target directory
+    let target_dir = if let Ok(target) = std::env::var("CARGO_TARGET_DIR") {
+        PathBuf::from(target)
+    } else {
+        workspace_root.join("target")
+    };
+
     let profile_dir = match profile {
         BuildProfile::Debug => "debug",
         BuildProfile::Release => "release",
