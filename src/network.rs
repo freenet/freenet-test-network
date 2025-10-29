@@ -4,8 +4,8 @@ use std::time::Duration;
 
 /// A test network consisting of gateways and peer nodes
 pub struct TestNetwork {
-    gateways: Vec<TestPeer>,
-    peers: Vec<TestPeer>,
+    pub(crate) gateways: Vec<TestPeer>,
+    pub(crate) peers: Vec<TestPeer>,
 }
 
 impl TestNetwork {

@@ -5,11 +5,13 @@
 
 mod binary;
 mod builder;
+mod logs;
 mod network;
 mod peer;
 
 pub use binary::FreenetBinary;
 pub use builder::NetworkBuilder;
+pub use logs::LogEntry;
 pub use network::{TestNetwork, NetworkTopology};
 pub use peer::TestPeer;
 
