@@ -81,10 +81,33 @@ fn is_in_freenet_workspace() -> bool {
 
 fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
     // Get workspace root BEFORE building
-    let workspace_root = std::env::current_dir()?
+    // Find the Cargo workspace root (with [workspace] section), not just any Cargo.toml
+    let cwd = std::env::current_dir()?;
+    let workspace_root = cwd
         .ancestors()
-        .find(|p| p.join("Cargo.toml").exists())
-        .ok_or_else(|| Error::InvalidBinary("Could not find workspace root".into()))?
+        .find(|p| {
+            let cargo_toml = p.join("Cargo.toml");
+            if !cargo_toml.exists() {
+                return false;
+            }
+            // Check if this is a workspace root
+            std::fs::read_to_string(&cargo_toml)
+                .map(|content| content.contains("[workspace]"))
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            // Fallback: just find any Cargo.toml with freenet binary
+            cwd.ancestors().find(|p| {
+                let cargo_toml = p.join("Cargo.toml");
+                if !cargo_toml.exists() {
+                    return false;
+                }
+                std::fs::read_to_string(&cargo_toml)
+                    .map(|content| content.contains("name = \"freenet\""))
+                    .unwrap_or(false)
+            })
+        })
+        .ok_or_else(|| Error::InvalidBinary("Could not find workspace root with freenet binary".into()))?
         .to_path_buf();
 
     let profile_arg = match profile {
@@ -121,8 +144,10 @@ fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
 
     if !binary.exists() {
         return Err(Error::InvalidBinary(format!(
-            "Built binary not found in target/{}",
-            profile_dir
+            "Built binary not found at: {} (workspace: {}, target_dir: {})",
+            binary.display(),
+            workspace_root.display(),
+            target_dir.display()
         )));
     }
 
