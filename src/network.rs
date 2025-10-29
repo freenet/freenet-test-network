@@ -6,6 +6,7 @@ use std::time::Duration;
 pub struct TestNetwork {
     pub(crate) gateways: Vec<TestPeer>,
     pub(crate) peers: Vec<TestPeer>,
+    pub(crate) min_connectivity: f64,
 }
 
 impl TestNetwork {
@@ -45,26 +46,25 @@ impl TestNetwork {
     /// Wait until the network is ready with a custom timeout
     pub async fn wait_until_ready_with_timeout(&self, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
-        let min_connectivity = 0.8; // 80% of peers should be connected
 
         tracing::info!(
             "Waiting for network connectivity (timeout: {}s, required: {}%)",
             timeout.as_secs(),
-            (min_connectivity * 100.0) as u8
+            (self.min_connectivity * 100.0) as u8
         );
 
         loop {
             if start.elapsed() > timeout {
                 return Err(Error::ConnectivityFailed(format!(
                     "Network did not reach {}% connectivity within {}s",
-                    (min_connectivity * 100.0) as u8,
+                    (self.min_connectivity * 100.0) as u8,
                     timeout.as_secs()
                 )));
             }
 
             // Check connectivity by querying peers for their connections
             match self.check_connectivity().await {
-                Ok(ratio) if ratio >= min_connectivity => {
+                Ok(ratio) if ratio >= self.min_connectivity => {
                     tracing::info!("Network ready: {:.1}% connectivity", ratio * 100.0);
                     return Ok(());
                 }
@@ -193,8 +193,8 @@ impl TestNetwork {
 }
 
 impl TestNetwork {
-    pub(crate) fn new(gateways: Vec<TestPeer>, peers: Vec<TestPeer>) -> Self {
-        Self { gateways, peers }
+    pub(crate) fn new(gateways: Vec<TestPeer>, peers: Vec<TestPeer>, min_connectivity: f64) -> Self {
+        Self { gateways, peers, min_connectivity }
     }
 }
 

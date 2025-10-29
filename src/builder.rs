@@ -9,6 +9,11 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
+struct GatewayInfo {
+    address: String,
+    public_key_path: PathBuf,
+}
+
 /// Builder for configuring and creating a test network
 pub struct NetworkBuilder {
     gateways: usize,
@@ -82,10 +87,13 @@ impl NetworkBuilder {
             gateways.push(peer);
         }
 
-        // Collect gateway addresses for peers to connect to
-        let gateway_addrs: Vec<_> = gateways
+        // Collect gateway info for peers to connect to
+        let gateway_info: Vec<_> = gateways
             .iter()
-            .map(|gw| format!("127.0.0.1:{}", gw.network_port))
+            .map(|gw| GatewayInfo {
+                address: format!("127.0.0.1:{}", gw.network_port),
+                public_key_path: gw.public_key_path.clone().expect("Gateway must have public key"),
+            })
             .collect();
 
         // Start regular peers
@@ -95,12 +103,12 @@ impl NetworkBuilder {
                 &binary_path,
                 i + self.gateways,
                 false,
-                &gateway_addrs,
+                &gateway_info,
             ).await?;
             peers.push(peer);
         }
 
-        let network = TestNetwork::new(gateways, peers);
+        let network = TestNetwork::new(gateways, peers, self.min_connectivity);
 
         // Wait for network to be ready
         network.wait_until_ready_with_timeout(self.connectivity_timeout).await?;
@@ -128,7 +136,7 @@ impl NetworkBuilder {
         binary_path: &PathBuf,
         index: usize,
         is_gateway: bool,
-        gateway_addrs: &[String],
+        gateway_info: &[GatewayInfo],
     ) -> Result<TestPeer> {
         let ws_port = get_free_port()?;
         let network_port = get_free_port()?;
@@ -149,12 +157,13 @@ impl NetworkBuilder {
         );
 
         // Generate keypair if gateway
-        let keypair_path = if is_gateway {
+        let (keypair_path, public_key_path) = if is_gateway {
             let keypair = data_dir.path().join("keypair.pem");
-            generate_keypair(&keypair)?;
-            Some(keypair)
+            let pubkey = data_dir.path().join("public_key.pem");
+            generate_keypair(&keypair, &pubkey)?;
+            (Some(keypair), Some(pubkey))
         } else {
-            None
+            (None, None)
         };
 
         // Build command
@@ -180,16 +189,19 @@ impl NetworkBuilder {
         }
 
         // Add gateway addresses for regular peers
-        if !is_gateway && !gateway_addrs.is_empty() {
-            // Write gateways config file
+        if !is_gateway && !gateway_info.is_empty() {
+            // Write gateways config file with proper TOML format
             let gateways_toml = data_dir.path().join("gateways.toml");
-            let content = format!(
-                "gateways = [{}]",
-                gateway_addrs.iter()
-                    .map(|addr| format!("\"{}\"", addr))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            let mut content = String::new();
+            for gw in gateway_info {
+                content.push_str(&format!(
+                    "[[gateways]]\n\
+                     address = {{ hostname = \"{}\" }}\n\
+                     public_key = \"{}\"\n\n",
+                    gw.address,
+                    gw.public_key_path.display()
+                ));
+            }
             std::fs::write(&gateways_toml, content)?;
         }
 
@@ -213,18 +225,20 @@ impl NetworkBuilder {
             network_port,
             data_dir,
             process: Some(process),
+            public_key_path,
         })
     }
 }
 
-fn generate_keypair(path: &std::path::Path) -> Result<()> {
+fn generate_keypair(private_key_path: &std::path::Path, public_key_path: &std::path::Path) -> Result<()> {
+    // Generate private key
     let output = Command::new("openssl")
         .args([
             "genpkey",
             "-algorithm",
             "RSA",
             "-out",
-            path.to_str().unwrap(),
+            private_key_path.to_str().unwrap(),
             "-pkeyopt",
             "rsa_keygen_bits:2048",
         ])
@@ -232,7 +246,26 @@ fn generate_keypair(path: &std::path::Path) -> Result<()> {
 
     if !output.status.success() {
         return Err(Error::Other(anyhow::anyhow!(
-            "Failed to generate keypair: {}",
+            "Failed to generate private key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    // Extract public key
+    let output = Command::new("openssl")
+        .args([
+            "rsa",
+            "-pubout",
+            "-in",
+            private_key_path.to_str().unwrap(),
+            "-out",
+            public_key_path.to_str().unwrap(),
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(Error::Other(anyhow::anyhow!(
+            "Failed to extract public key: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }

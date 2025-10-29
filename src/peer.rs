@@ -11,6 +11,7 @@ pub struct TestPeer {
     pub(crate) network_port: u16,
     pub(crate) data_dir: TempDir,
     pub(crate) process: Option<Child>,
+    pub(crate) public_key_path: Option<PathBuf>,
 }
 
 impl TestPeer {
