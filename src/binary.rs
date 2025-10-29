@@ -1,11 +1,18 @@
 use crate::{Error, Result};
 use std::path::{Path, PathBuf};
 
+/// Build profile for compiling freenet
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildProfile {
+    Debug,
+    Release,
+}
+
 /// Specifies which freenet binary to use for the test network
 #[derive(Debug, Clone)]
 pub enum FreenetBinary {
     /// Build and use binary from current cargo workspace
-    CurrentCrate,
+    CurrentCrate(BuildProfile),
 
     /// Use `freenet` binary from PATH
     Installed,
@@ -13,16 +20,17 @@ pub enum FreenetBinary {
     /// Use binary at specific path
     Path(PathBuf),
 
-    /// Build binary from a cargo workspace at path
-    CargoWorkspace(PathBuf),
+    /// Build binary from a cargo workspace at specified path
+    /// Use this for worktrees or when freenet-core is in a different location
+    Workspace { path: PathBuf, profile: BuildProfile },
 }
 
 impl Default for FreenetBinary {
     fn default() -> Self {
-        // Smart default: If in freenet-core workspace, use CurrentCrate
+        // Smart default: If in freenet-core workspace, use CurrentCrate with debug
         // Otherwise, try Installed
         if is_in_freenet_workspace() {
-            Self::CurrentCrate
+            Self::CurrentCrate(BuildProfile::Debug)
         } else if which::which("freenet").is_ok() {
             Self::Installed
         } else {
@@ -35,9 +43,9 @@ impl FreenetBinary {
     /// Resolve to actual binary path, building if necessary
     pub fn resolve(&self) -> Result<PathBuf> {
         match self {
-            Self::CurrentCrate => {
-                tracing::info!("Building freenet binary from current workspace");
-                build_current_workspace()
+            Self::CurrentCrate(profile) => {
+                tracing::info!("Building freenet binary from current workspace ({:?})", profile);
+                build_current_workspace(*profile)
             }
             Self::Installed => {
                 which::which("freenet")
@@ -51,9 +59,9 @@ impl FreenetBinary {
                 }
                 Ok(p.clone())
             }
-            Self::CargoWorkspace(workspace) => {
-                tracing::info!("Building freenet binary from workspace: {}", workspace.display());
-                build_workspace(workspace)
+            Self::Workspace { path, profile } => {
+                tracing::info!("Building freenet binary from workspace: {} ({:?})", path.display(), profile);
+                build_workspace(path, *profile)
             }
         }
     }
@@ -71,10 +79,16 @@ fn is_in_freenet_workspace() -> bool {
         .unwrap_or(false)
 }
 
-fn build_current_workspace() -> Result<PathBuf> {
-    let output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "freenet", "--release"])
-        .output()?;
+fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
+    let profile_arg = match profile {
+        BuildProfile::Debug => vec!["build"],
+        BuildProfile::Release => vec!["build", "--release"],
+    };
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(&profile_arg).args(["--bin", "freenet"]);
+
+    let output = cmd.output()?;
 
     if !output.status.success() {
         return Err(Error::InvalidBinary(format!(
@@ -83,22 +97,35 @@ fn build_current_workspace() -> Result<PathBuf> {
         )));
     }
 
-    // Find the binary in target/release
     let target_dir = get_target_dir()?;
-    let binary = target_dir.join("release/freenet");
+    let profile_dir = match profile {
+        BuildProfile::Debug => "debug",
+        BuildProfile::Release => "release",
+    };
+    let binary = target_dir.join(format!("{}/freenet", profile_dir));
 
     if !binary.exists() {
-        return Err(Error::InvalidBinary("Built binary not found in target/release".into()));
+        return Err(Error::InvalidBinary(format!(
+            "Built binary not found in target/{}",
+            profile_dir
+        )));
     }
 
     Ok(binary)
 }
 
-fn build_workspace(workspace: &Path) -> Result<PathBuf> {
-    let output = std::process::Command::new("cargo")
-        .args(["build", "--bin", "freenet", "--release"])
-        .current_dir(workspace)
-        .output()?;
+fn build_workspace(workspace: &Path, profile: BuildProfile) -> Result<PathBuf> {
+    let profile_arg = match profile {
+        BuildProfile::Debug => vec!["build"],
+        BuildProfile::Release => vec!["build", "--release"],
+    };
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(&profile_arg)
+        .args(["--bin", "freenet"])
+        .current_dir(workspace);
+
+    let output = cmd.output()?;
 
     if !output.status.success() {
         return Err(Error::InvalidBinary(format!(
@@ -109,10 +136,17 @@ fn build_workspace(workspace: &Path) -> Result<PathBuf> {
     }
 
     let target_dir = workspace.join("target");
-    let binary = target_dir.join("release/freenet");
+    let profile_dir = match profile {
+        BuildProfile::Debug => "debug",
+        BuildProfile::Release => "release",
+    };
+    let binary = target_dir.join(format!("{}/freenet", profile_dir));
 
     if !binary.exists() {
-        return Err(Error::InvalidBinary("Built binary not found in target/release".into()));
+        return Err(Error::InvalidBinary(format!(
+            "Built binary not found in target/{}",
+            profile_dir
+        )));
     }
 
     Ok(binary)
