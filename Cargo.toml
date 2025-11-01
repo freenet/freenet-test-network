@@ -21,7 +21,7 @@ which = "8.0.0"
 sysinfo = "0.37.2"
 futures = "0.3.31"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-freenet-stdlib = { path = "../freenet-stdlib/rust", features = ["net"] }
+freenet-stdlib = { version = "0.1.23", features = ["net"] }
 
 [dev-dependencies]
 testresult = "0.4"
