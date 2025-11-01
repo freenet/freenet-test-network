@@ -12,7 +12,7 @@ mod peer;
 pub use binary::{BuildProfile, FreenetBinary};
 pub use builder::NetworkBuilder;
 pub use logs::LogEntry;
-pub use network::{TestNetwork, NetworkTopology};
+pub use network::{NetworkTopology, TestNetwork};
 pub use peer::TestPeer;
 
 /// Result type used throughout this crate

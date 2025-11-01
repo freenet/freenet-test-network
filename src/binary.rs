@@ -22,7 +22,10 @@ pub enum FreenetBinary {
 
     /// Build binary from a cargo workspace at specified path
     /// Use this for worktrees or when freenet-core is in a different location
-    Workspace { path: PathBuf, profile: BuildProfile },
+    Workspace {
+        path: PathBuf,
+        profile: BuildProfile,
+    },
 }
 
 impl Default for FreenetBinary {
@@ -44,23 +47,32 @@ impl FreenetBinary {
     pub fn resolve(&self) -> Result<PathBuf> {
         match self {
             Self::CurrentCrate(profile) => {
-                tracing::info!("Building freenet binary from current workspace ({:?})", profile);
+                tracing::info!(
+                    "Building freenet binary from current workspace ({:?})",
+                    profile
+                );
                 build_current_workspace(*profile)
             }
-            Self::Installed => {
-                which::which("freenet")
-                    .map_err(|_| Error::InvalidBinary(
-                        "freenet binary not found in PATH. Install with: cargo install freenet".into()
-                    ))
-            }
+            Self::Installed => which::which("freenet").map_err(|_| {
+                Error::InvalidBinary(
+                    "freenet binary not found in PATH. Install with: cargo install freenet".into(),
+                )
+            }),
             Self::Path(p) => {
                 if !p.exists() {
-                    return Err(Error::InvalidBinary(format!("Binary not found: {}", p.display())));
+                    return Err(Error::InvalidBinary(format!(
+                        "Binary not found: {}",
+                        p.display()
+                    )));
                 }
                 Ok(p.clone())
             }
             Self::Workspace { path, profile } => {
-                tracing::info!("Building freenet binary from workspace: {} ({:?})", path.display(), profile);
+                tracing::info!(
+                    "Building freenet binary from workspace: {} ({:?})",
+                    path.display(),
+                    profile
+                );
                 build_workspace(path, *profile)
             }
         }
@@ -107,7 +119,9 @@ fn build_current_workspace(profile: BuildProfile) -> Result<PathBuf> {
                     .unwrap_or(false)
             })
         })
-        .ok_or_else(|| Error::InvalidBinary("Could not find workspace root with freenet binary".into()))?
+        .ok_or_else(|| {
+            Error::InvalidBinary("Could not find workspace root with freenet binary".into())
+        })?
         .to_path_buf();
 
     let profile_arg = match profile {

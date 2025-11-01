@@ -39,6 +39,26 @@ async fn my_test() -> anyhow::Result<()> {
 
 **Alpha** - Core functionality working, connectivity detection still uses placeholder.
 
+## Diagnostics
+
+When a network fails to reach the desired connectivity threshold the builder now:
+
+- Prints the most recent log entries across **all peers in chronological order**
+- Can optionally preserve each peer's data directory (including `peer.log`, configs, and keys) for later inspection
+
+Enable preservation with:
+
+```rust
+let network = TestNetwork::builder()
+    .gateways(1)
+    .peers(2)
+    .preserve_temp_dirs_on_failure(true)
+    .build()
+    .await?;
+```
+
+If startup fails, the preserved artifacts are placed under `/tmp/freenet-test-network-<timestamp>/`.
+
 ### TODO
 - [ ] Implement proper connectivity detection (fix FIXME from fdev)
 - [ ] Add WebSocket connection helpers

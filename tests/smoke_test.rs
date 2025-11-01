@@ -1,6 +1,6 @@
 //! Basic smoke test - just verify network starts
 
-use freenet_test_network::{TestNetwork, FreenetBinary};
+use freenet_test_network::{FreenetBinary, TestNetwork};
 
 #[tokio::test]
 async fn test_network_starts() -> anyhow::Result<()> {

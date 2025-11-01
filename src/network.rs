@@ -1,4 +1,5 @@
 use crate::{peer::TestPeer, Error, Result};
+use freenet_stdlib::client_api::{ClientRequest, HostResponse, NodeQuery, QueryResponse, WebApi};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -40,7 +41,8 @@ impl TestNetwork {
     /// This checks that peers have formed connections and the network
     /// is sufficiently connected for testing.
     pub async fn wait_until_ready(&self) -> Result<()> {
-        self.wait_until_ready_with_timeout(Duration::from_secs(30)).await
+        self.wait_until_ready_with_timeout(Duration::from_secs(30))
+            .await
     }
 
     /// Wait until the network is ready with a custom timeout
@@ -114,55 +116,40 @@ impl TestNetwork {
     async fn query_peer_connections(&self, peer: &TestPeer) -> Result<usize> {
         use tokio_tungstenite::connect_async;
 
-        let url = peer.ws_url();
-        let (ws_stream, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            connect_async(&url)
-        ).await
-            .map_err(|_| Error::ConnectivityFailed(format!("Timeout connecting to {}", url)))?
-            .map_err(|e| Error::ConnectivityFailed(format!("Failed to connect to {}: {}", url, e)))?;
+        let url = format!("{}?encodingProtocol=native", peer.ws_url());
+        let (ws_stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), connect_async(&url))
+                .await
+                .map_err(|_| Error::ConnectivityFailed(format!("Timeout connecting to {}", url)))?
+                .map_err(|e| {
+                    Error::ConnectivityFailed(format!("Failed to connect to {}: {}", url, e))
+                })?;
 
-        use futures::stream::StreamExt;
-        use futures::sink::SinkExt;
-        let (mut write, mut read) = ws_stream.split();
+        let mut client = WebApi::start(ws_stream);
 
-        // Send ConnectedPeers query
-        let query = serde_json::json!({
-            "NodeQueries": {
-                "ConnectedPeers": {}
-            }
-        });
-
-        let msg = tokio_tungstenite::tungstenite::Message::Text(query.to_string());
-        write.send(msg).await
+        client
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await
             .map_err(|e| Error::ConnectivityFailed(format!("Failed to send query: {}", e)))?;
 
-        // Read response
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            read.next()
-        ).await
-            .map_err(|_| Error::ConnectivityFailed("Timeout waiting for response".into()))?
-            .ok_or_else(|| Error::ConnectivityFailed("No response received".into()))?
-            .map_err(|e| Error::ConnectivityFailed(format!("WebSocket error: {}", e)))?;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), client.recv())
+            .await
+            .map_err(|_| Error::ConnectivityFailed("Timeout waiting for response".into()))?;
 
-        // Parse response
-        let text = response.to_text()
-            .map_err(|e| Error::ConnectivityFailed(format!("Invalid response: {}", e)))?;
+        let result = match response {
+            Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers })) => {
+                Ok(peers.len())
+            }
+            Ok(other) => Err(Error::ConnectivityFailed(format!(
+                "Unexpected response: {:?}",
+                other
+            ))),
+            Err(e) => Err(Error::ConnectivityFailed(format!("Query failed: {}", e))),
+        };
 
-        let resp: serde_json::Value = serde_json::from_str(text)
-            .map_err(|e| Error::ConnectivityFailed(format!("JSON parse error: {}", e)))?;
+        client.disconnect("connectivity probe").await;
 
-        // Extract peer count from response
-        if let Some(peers) = resp.get("QueryResponse")
-            .and_then(|q| q.get("ConnectedPeers"))
-            .and_then(|c| c.get("peers"))
-            .and_then(|p| p.as_array())
-        {
-            Ok(peers.len())
-        } else {
-            Err(Error::ConnectivityFailed(format!("Unexpected response format: {}", text)))
-        }
+        result
     }
 
     /// Get the current network topology
@@ -176,25 +163,38 @@ impl TestNetwork {
 
     /// Export network information in JSON format for visualization tools
     pub fn export_for_viz(&self) -> String {
-        let peers: Vec<_> = self.gateways.iter()
+        let peers: Vec<_> = self
+            .gateways
+            .iter()
             .chain(self.peers.iter())
-            .map(|p| serde_json::json!({
-                "id": p.id(),
-                "is_gateway": p.is_gateway(),
-                "ws_port": p.ws_port,
-                "network_port": p.network_port,
-            }))
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id(),
+                    "is_gateway": p.is_gateway(),
+                    "ws_port": p.ws_port,
+                    "network_port": p.network_port,
+                })
+            })
             .collect();
 
         serde_json::to_string_pretty(&serde_json::json!({
             "peers": peers
-        })).unwrap_or_default()
+        }))
+        .unwrap_or_default()
     }
 }
 
 impl TestNetwork {
-    pub(crate) fn new(gateways: Vec<TestPeer>, peers: Vec<TestPeer>, min_connectivity: f64) -> Self {
-        Self { gateways, peers, min_connectivity }
+    pub(crate) fn new(
+        gateways: Vec<TestPeer>,
+        peers: Vec<TestPeer>,
+        min_connectivity: f64,
+    ) -> Self {
+        Self {
+            gateways,
+            peers,
+            min_connectivity,
+        }
     }
 }
 

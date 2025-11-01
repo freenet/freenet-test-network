@@ -30,6 +30,11 @@ impl TestPeer {
         self.is_gateway
     }
 
+    /// Get the root data directory for this peer
+    pub fn data_dir_path(&self) -> &std::path::Path {
+        self.data_dir.path()
+    }
+
     /// Get the path to this peer's log file
     pub fn log_path(&self) -> PathBuf {
         self.data_dir.path().join("peer.log")

@@ -10,7 +10,7 @@ categories = ["development-tools::testing"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 anyhow = "1"
 thiserror = "1"
 tempfile = "3"
@@ -20,6 +20,8 @@ tracing = "0.1"
 which = "8.0.0"
 sysinfo = "0.37.2"
 futures = "0.3.31"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+freenet-stdlib = { path = "../freenet-stdlib/rust", features = ["net"] }
 
 [dev-dependencies]
 testresult = "0.4"
