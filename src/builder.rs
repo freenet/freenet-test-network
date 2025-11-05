@@ -23,6 +23,7 @@ pub struct NetworkBuilder {
     min_connectivity: f64,
     connectivity_timeout: Duration,
     preserve_data_on_failure: bool,
+    preserve_data_on_success: bool,
 }
 
 impl Default for NetworkBuilder {
@@ -40,6 +41,7 @@ impl NetworkBuilder {
             min_connectivity: 1.0, // Default: require all peers connected
             connectivity_timeout: Duration::from_secs(30),
             preserve_data_on_failure: false,
+            preserve_data_on_success: false,
         }
     }
 
@@ -76,6 +78,12 @@ impl NetworkBuilder {
     /// Preserve peer data directories in `/tmp` when network startup fails
     pub fn preserve_temp_dirs_on_failure(mut self, preserve: bool) -> Self {
         self.preserve_data_on_failure = preserve;
+        self
+    }
+
+    /// Preserve peer data directories in `/tmp` even when the network boots successfully.
+    pub fn preserve_temp_dirs_on_success(mut self, preserve: bool) -> Self {
+        self.preserve_data_on_success = preserve;
         self
     }
 
@@ -124,7 +132,25 @@ impl NetworkBuilder {
             .wait_until_ready_with_timeout(self.connectivity_timeout)
             .await
         {
-            Ok(()) => Ok(network),
+            Ok(()) => {
+                if self.preserve_data_on_success {
+                    match preserve_network_state(&network) {
+                        Ok(path) => {
+                            println!(
+                                "Network data directories preserved at {}",
+                                path.display()
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "Failed to preserve network data directories after success: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+                Ok(network)
+            }
             Err(err) => {
                 if let Err(log_err) = dump_recent_logs(&network) {
                     eprintln!("Failed to dump logs after connectivity error: {}", log_err);
