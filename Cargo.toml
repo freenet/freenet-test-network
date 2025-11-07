@@ -1,6 +1,6 @@
 [package]
 name = "freenet-test-network"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "LGPL-3.0-only"
 description = "Reliable test network infrastructure for Freenet"
@@ -13,7 +13,6 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
 anyhow = "1"
 thiserror = "1"
-tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

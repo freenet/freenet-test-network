@@ -1,6 +1,7 @@
 use crate::{peer::TestPeer, Error, Result};
 use freenet_stdlib::client_api::{ClientRequest, HostResponse, NodeQuery, QueryResponse, WebApi};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// A test network consisting of gateways and peer nodes
@@ -8,6 +9,7 @@ pub struct TestNetwork {
     pub(crate) gateways: Vec<TestPeer>,
     pub(crate) peers: Vec<TestPeer>,
     pub(crate) min_connectivity: f64,
+    pub(crate) run_root: PathBuf,
 }
 
 impl TestNetwork {
@@ -189,12 +191,19 @@ impl TestNetwork {
         gateways: Vec<TestPeer>,
         peers: Vec<TestPeer>,
         min_connectivity: f64,
+        run_root: PathBuf,
     ) -> Self {
         Self {
             gateways,
             peers,
             min_connectivity,
+            run_root,
         }
+    }
+
+    /// Directory containing all peer state/logs for this test network run.
+    pub fn run_root(&self) -> &std::path::Path {
+        &self.run_root
     }
 }
 

@@ -1,7 +1,6 @@
 use crate::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Child;
-use tempfile::TempDir;
 
 /// Represents a single peer in the test network
 pub struct TestPeer {
@@ -9,7 +8,7 @@ pub struct TestPeer {
     pub(crate) is_gateway: bool,
     pub(crate) ws_port: u16,
     pub(crate) network_port: u16,
-    pub(crate) data_dir: TempDir,
+    pub(crate) data_dir: PathBuf,
     pub(crate) process: Option<Child>,
     pub(crate) public_key_path: Option<PathBuf>,
 }
@@ -31,13 +30,13 @@ impl TestPeer {
     }
 
     /// Get the root data directory for this peer
-    pub fn data_dir_path(&self) -> &std::path::Path {
-        self.data_dir.path()
+    pub fn data_dir_path(&self) -> &Path {
+        &self.data_dir
     }
 
     /// Get the path to this peer's log file
     pub fn log_path(&self) -> PathBuf {
-        self.data_dir.path().join("peer.log")
+        self.data_dir.join("peer.log")
     }
 
     /// Check if the peer process is still running

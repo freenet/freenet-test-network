@@ -367,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-test-network"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -376,7 +376,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
- "tempfile",
  "testresult",
  "thiserror 1.0.69",
  "tokio",

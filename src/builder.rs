@@ -5,10 +5,10 @@ use crate::{
     Error, Result,
 };
 use chrono::Utc;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
-use tempfile::TempDir;
+use std::time::{Duration, SystemTime};
 
 struct GatewayInfo {
     address: String,
@@ -97,10 +97,24 @@ impl NetworkBuilder {
             self.peers
         );
 
+        let base_dir = resolve_base_dir();
+        fs::create_dir_all(&base_dir)?;
+        cleanup_old_runs(&base_dir, 5)?;
+        let run_root = create_run_directory(&base_dir)?;
+
+        let mut run_status = RunStatusGuard::new(&run_root);
+
         // Start gateways first
         let mut gateways = Vec::new();
         for i in 0..self.gateways {
-            let peer = self.start_peer(&binary_path, i, true).await?;
+            let peer = match self.start_peer(&binary_path, i, true, &run_root).await {
+                Ok(peer) => peer,
+                Err(err) => {
+                    let detail = format!("failed to start gateway {i}: {err}");
+                    run_status.mark("failure", Some(&detail));
+                    return Err(err);
+                }
+            };
             gateways.push(peer);
         }
 
@@ -119,13 +133,30 @@ impl NetworkBuilder {
         // Start regular peers
         let mut peers = Vec::new();
         for i in 0..self.peers {
-            let peer = self
-                .start_peer_with_gateways(&binary_path, i + self.gateways, false, &gateway_info)
-                .await?;
+            let peer = match self
+                .start_peer_with_gateways(
+                    &binary_path,
+                    i + self.gateways,
+                    false,
+                    &gateway_info,
+                    &run_root,
+                )
+                .await
+            {
+                Ok(peer) => peer,
+                Err(err) => {
+                    let detail = format!("failed to start peer {}: {}", i + self.gateways, err);
+                    run_status.mark("failure", Some(&detail));
+                    return Err(err);
+                }
+            };
             peers.push(peer);
+            if i + 1 < self.peers {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
 
-        let network = TestNetwork::new(gateways, peers, self.min_connectivity);
+        let network = TestNetwork::new(gateways, peers, self.min_connectivity, run_root.clone());
 
         // Wait for network to be ready
         match network
@@ -136,10 +167,7 @@ impl NetworkBuilder {
                 if self.preserve_data_on_success {
                     match preserve_network_state(&network) {
                         Ok(path) => {
-                            println!(
-                                "Network data directories preserved at {}",
-                                path.display()
-                            );
+                            println!("Network data directories preserved at {}", path.display());
                         }
                         Err(err) => {
                             eprintln!(
@@ -149,6 +177,8 @@ impl NetworkBuilder {
                         }
                     }
                 }
+                let detail = format!("success: gateways={}, peers={}", self.gateways, self.peers);
+                run_status.mark("success", Some(&detail));
                 Ok(network)
             }
             Err(err) => {
@@ -165,6 +195,8 @@ impl NetworkBuilder {
                         }
                     }
                 }
+                let detail = err.to_string();
+                run_status.mark("failure", Some(&detail));
                 Err(err)
             }
         }
@@ -180,8 +212,9 @@ impl NetworkBuilder {
         binary_path: &PathBuf,
         index: usize,
         is_gateway: bool,
+        run_root: &Path,
     ) -> Result<TestPeer> {
-        self.start_peer_with_gateways(binary_path, index, is_gateway, &[])
+        self.start_peer_with_gateways(binary_path, index, is_gateway, &[], run_root)
             .await
     }
 
@@ -191,16 +224,16 @@ impl NetworkBuilder {
         index: usize,
         is_gateway: bool,
         gateway_info: &[GatewayInfo],
+        run_root: &Path,
     ) -> Result<TestPeer> {
         let ws_port = get_free_port()?;
         let network_port = get_free_port()?;
-        let data_dir = TempDir::new()?;
-
         let id = if is_gateway {
             format!("gw{}", index)
         } else {
             format!("peer{}", index)
         };
+        let data_dir = create_peer_dir(run_root, &id)?;
 
         tracing::debug!(
             "Starting {} {} - ws:{} net:{}",
@@ -212,8 +245,8 @@ impl NetworkBuilder {
 
         // Generate keypair if gateway
         let (keypair_path, public_key_path) = if is_gateway {
-            let keypair = data_dir.path().join("keypair.pem");
-            let pubkey = data_dir.path().join("public_key.pem");
+            let keypair = data_dir.join("keypair.pem");
+            let pubkey = data_dir.join("public_key.pem");
             generate_keypair(&keypair, &pubkey)?;
             (Some(keypair), Some(pubkey))
         } else {
@@ -224,9 +257,9 @@ impl NetworkBuilder {
         let mut cmd = Command::new(binary_path);
         cmd.arg("network")
             .arg("--data-dir")
-            .arg(data_dir.path())
+            .arg(&data_dir)
             .arg("--config-dir")
-            .arg(data_dir.path())
+            .arg(&data_dir)
             .arg("--ws-api-port")
             .arg(ws_port.to_string())
             .arg("--network-port")
@@ -246,7 +279,7 @@ impl NetworkBuilder {
         // Add gateway addresses for regular peers
         if !is_gateway && !gateway_info.is_empty() {
             // Write gateways config file with proper TOML format
-            let gateways_toml = data_dir.path().join("gateways.toml");
+            let gateways_toml = data_dir.join("gateways.toml");
             let mut content = String::new();
             for gw in gateway_info {
                 content.push_str(&format!(
@@ -261,7 +294,8 @@ impl NetworkBuilder {
         }
 
         // Set environment and spawn
-        let log_file = std::fs::File::create(data_dir.path().join("peer.log"))?;
+        let log_path = data_dir.join("peer.log");
+        let log_file = std::fs::File::create(&log_path)?;
         cmd.env("RUST_LOG", "info")
             .env("RUST_BACKTRACE", "1")
             .stdout(Stdio::from(log_file.try_clone()?))
@@ -283,6 +317,103 @@ impl NetworkBuilder {
             process: Some(process),
             public_key_path,
         })
+    }
+}
+
+fn resolve_base_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("FREENET_TEST_NETWORK_BASE_DIR") {
+        PathBuf::from(path)
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join("code/tmp/freenet-test-networks")
+    } else {
+        std::env::temp_dir().join("freenet-test-networks")
+    }
+}
+
+fn cleanup_old_runs(base_dir: &Path, max_runs: usize) -> Result<()> {
+    let mut runs: Vec<(PathBuf, SystemTime)> = fs::read_dir(base_dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((entry.path(), modified))
+        })
+        .collect();
+
+    if runs.len() <= max_runs {
+        return Ok(());
+    }
+
+    runs.sort_by_key(|(_, modified)| *modified);
+    let remove_count = runs.len() - max_runs;
+    for (path, _) in runs.into_iter().take(remove_count) {
+        if let Err(err) = fs::remove_dir_all(&path) {
+            tracing::warn!(
+                ?err,
+                path = %path.display(),
+                "Failed to remove old freenet test network run directory"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn create_run_directory(base_dir: &Path) -> Result<PathBuf> {
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    for attempt in 0..100 {
+        let candidate = if attempt == 0 {
+            base_dir.join(&timestamp)
+        } else {
+            base_dir.join(format!("{}-{}", &timestamp, attempt))
+        };
+        if !candidate.exists() {
+            fs::create_dir_all(&candidate)?;
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::Other(anyhow::anyhow!(
+        "Unable to allocate run directory after repeated attempts"
+    )))
+}
+
+fn create_peer_dir(run_root: &Path, id: &str) -> Result<PathBuf> {
+    let dir = run_root.join(id);
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+struct RunStatusGuard {
+    status_path: PathBuf,
+}
+
+impl RunStatusGuard {
+    fn new(run_root: &Path) -> Self {
+        let status_path = run_root.join("run_status.txt");
+        let _ = fs::write(&status_path, b"status=initializing\n");
+        Self { status_path }
+    }
+
+    fn mark(&mut self, status: &str, detail: Option<&str>) {
+        let mut content = format!("status={}", status);
+        if let Some(detail) = detail {
+            content.push('\n');
+            content.push_str("detail=");
+            content.push_str(detail);
+        }
+        content.push('\n');
+        if let Err(err) = fs::write(&self.status_path, content) {
+            tracing::warn!(
+                ?err,
+                path = %self.status_path.display(),
+                "Failed to write run status"
+            );
+        }
     }
 }
 
@@ -367,32 +498,5 @@ fn dump_recent_logs(network: &TestNetwork) -> Result<()> {
 }
 
 fn preserve_network_state(network: &TestNetwork) -> Result<PathBuf> {
-    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
-    let root = std::env::temp_dir().join(format!("freenet-test-network-{}", timestamp));
-    std::fs::create_dir_all(&root)?;
-
-    for peer in network.gateways.iter().chain(network.peers.iter()) {
-        let dest = root.join(peer.id());
-        copy_dir_recursive(peer.data_dir_path(), &dest)?;
-    }
-
-    Ok(root)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let dest_path = dst.join(entry.file_name());
-
-        if file_type.is_dir() {
-            copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
-            std::fs::copy(entry.path(), dest_path)?;
-        }
-    }
-
-    Ok(())
+    Ok(network.run_root().to_path_buf())
 }
