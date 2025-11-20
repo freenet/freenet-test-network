@@ -1,6 +1,5 @@
-use crate::Result;
+use crate::{process::PeerProcess, remote::PeerLocation, Result};
 use std::path::{Path, PathBuf};
-use std::process::Child;
 
 /// Represents a single peer in the test network
 pub struct TestPeer {
@@ -8,9 +7,11 @@ pub struct TestPeer {
     pub(crate) is_gateway: bool,
     pub(crate) ws_port: u16,
     pub(crate) network_port: u16,
+    pub(crate) network_address: String,
     pub(crate) data_dir: PathBuf,
-    pub(crate) process: Option<Child>,
+    pub(crate) process: Box<dyn PeerProcess + Send>,
     pub(crate) public_key_path: Option<PathBuf>,
+    pub(crate) location: PeerLocation,
 }
 
 impl TestPeer {
@@ -29,6 +30,11 @@ impl TestPeer {
         self.is_gateway
     }
 
+    /// Get the peer's network address
+    pub fn network_address(&self) -> &str {
+        &self.network_address
+    }
+
     /// Get the root data directory for this peer
     pub fn data_dir_path(&self) -> &Path {
         &self.data_dir
@@ -36,37 +42,22 @@ impl TestPeer {
 
     /// Get the path to this peer's log file
     pub fn log_path(&self) -> PathBuf {
-        self.data_dir.join("peer.log")
+        self.process.log_path()
     }
 
     /// Check if the peer process is still running
     pub fn is_running(&self) -> bool {
-        if let Some(process) = &self.process {
-            let pid = process.id();
-            let mut system = sysinfo::System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-            system.process(sysinfo::Pid::from_u32(pid as u32)).is_some()
-        } else {
-            false
-        }
+        self.process.is_running()
     }
 
     /// Kill the peer process
     pub fn kill(&mut self) -> Result<()> {
-        if let Some(mut process) = self.process.take() {
-            process.kill()?;
-            process.wait()?;
-        }
-        Ok(())
+        self.process.kill()
     }
-}
 
-impl Drop for TestPeer {
-    fn drop(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            let _ = process.kill();
-            let _ = process.wait();
-        }
+    /// Get the peer's location (local or remote)
+    pub fn location(&self) -> &PeerLocation {
+        &self.location
     }
 }
 

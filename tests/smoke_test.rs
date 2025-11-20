@@ -13,6 +13,16 @@ async fn test_network_starts() -> anyhow::Result<()> {
         .build()
         .await?;
 
+    let ring_viz_path = network.run_root().join("ring_viz.html");
+    network
+        .write_ring_visualization(&ring_viz_path)
+        .await
+        .expect("ring visualization should be generated");
+    assert!(
+        ring_viz_path.exists(),
+        "ring visualization file should exist"
+    );
+
     // Verify network is accessible
     assert!(!network.gateway(0).ws_url().is_empty());
     assert!(!network.peer(0).ws_url().is_empty());

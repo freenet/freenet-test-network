@@ -1,8 +1,22 @@
 use crate::{peer::TestPeer, Error, Result};
-use freenet_stdlib::client_api::{ClientRequest, HostResponse, NodeQuery, QueryResponse, WebApi};
+use chrono::Utc;
+use freenet_stdlib::{
+    client_api::{
+        ClientRequest, ConnectedPeerInfo, HostResponse, NodeDiagnosticsConfig, NodeQuery,
+        QueryResponse, SystemMetrics, WebApi,
+    },
+    prelude::ContractKey,
+};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::time::Duration;
+use serde_json::json;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+    time::Duration,
+};
 
 /// A test network consisting of gateways and peer nodes
 pub struct TestNetwork {
@@ -184,6 +198,273 @@ impl TestNetwork {
         }))
         .unwrap_or_default()
     }
+
+    /// Collect diagnostics from every peer, returning a snapshot that can be serialized to JSON
+    /// for offline analysis.
+    pub async fn collect_diagnostics(&self) -> Result<NetworkDiagnosticsSnapshot> {
+        let mut peers = Vec::with_capacity(self.gateways.len() + self.peers.len());
+        for peer in self.gateways.iter().chain(self.peers.iter()) {
+            peers.push(self.query_peer_diagnostics(peer).await);
+        }
+        peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        Ok(NetworkDiagnosticsSnapshot {
+            collected_at: Utc::now(),
+            peers,
+        })
+    }
+
+    async fn query_peer_diagnostics(&self, peer: &TestPeer) -> PeerDiagnosticsSnapshot {
+        use tokio_tungstenite::connect_async;
+
+        let mut snapshot = PeerDiagnosticsSnapshot::new(peer);
+        let url = format!("{}?encodingProtocol=native", peer.ws_url());
+        match tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(&url)).await {
+            Ok(Ok((ws_stream, _))) => {
+                let mut client = WebApi::start(ws_stream);
+                let config = NodeDiagnosticsConfig {
+                    include_node_info: true,
+                    include_network_info: true,
+                    include_subscriptions: false,
+                    contract_keys: vec![],
+                    include_system_metrics: true,
+                    include_detailed_peer_info: true,
+                    include_subscriber_peer_ids: false,
+                };
+                if let Err(err) = client
+                    .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+                        config,
+                    }))
+                    .await
+                {
+                    snapshot.error = Some(format!("failed to send diagnostics request: {err}"));
+                    return snapshot;
+                }
+                match tokio::time::timeout(std::time::Duration::from_secs(10), client.recv()).await
+                {
+                    Ok(Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
+                        response,
+                    )))) => {
+                        let node_info = response.node_info;
+                        let network_info = response.network_info;
+                        snapshot.peer_id = node_info
+                            .as_ref()
+                            .map(|info| info.peer_id.clone())
+                            .unwrap_or_else(|| peer.id().to_string());
+                        snapshot.is_gateway = node_info
+                            .as_ref()
+                            .map(|info| info.is_gateway)
+                            .unwrap_or_else(|| peer.is_gateway());
+                        snapshot.location =
+                            node_info.as_ref().and_then(|info| info.location.clone());
+                        snapshot.listening_address = node_info
+                            .as_ref()
+                            .and_then(|info| info.listening_address.clone());
+                        if let Some(info) = network_info {
+                            snapshot.active_connections = Some(info.active_connections);
+                            snapshot.connected_peer_ids = info
+                                .connected_peers
+                                .into_iter()
+                                .map(|(peer_id, _)| peer_id)
+                                .collect();
+                        }
+                        snapshot.connected_peers_detailed = response.connected_peers_detailed;
+                        snapshot.system_metrics = response.system_metrics;
+                    }
+                    Ok(Ok(other)) => {
+                        snapshot.error =
+                            Some(format!("unexpected diagnostics response: {:?}", other));
+                    }
+                    Ok(Err(err)) => {
+                        snapshot.error = Some(format!("diagnostics channel error: {err}"));
+                    }
+                    Err(_) => {
+                        snapshot.error = Some("timeout waiting for diagnostics response".into());
+                    }
+                }
+            }
+            Ok(Err(err)) => {
+                snapshot.error = Some(format!("failed to connect websocket: {err}"));
+            }
+            Err(_) => {
+                snapshot.error = Some("timeout establishing diagnostics websocket".into());
+            }
+        }
+        snapshot
+    }
+
+    /// Collect per-peer ring data (locations + adjacency) for visualization/debugging.
+    pub async fn ring_snapshot(&self) -> Result<Vec<RingPeerSnapshot>> {
+        self.collect_ring_snapshot(None).await
+    }
+
+    async fn collect_ring_snapshot(
+        &self,
+        contract_key: Option<&ContractKey>,
+    ) -> Result<Vec<RingPeerSnapshot>> {
+        let mut snapshots = Vec::with_capacity(self.gateways.len() + self.peers.len());
+        for peer in self.gateways.iter().chain(self.peers.iter()) {
+            snapshots.push(query_ring_snapshot(peer, contract_key).await?);
+        }
+        snapshots.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(snapshots)
+    }
+
+    /// Generate an interactive HTML ring visualization for the current network.
+    pub async fn write_ring_visualization<P: AsRef<Path>>(&self, output_path: P) -> Result<()> {
+        self.write_ring_visualization_internal(output_path, None)
+            .await
+    }
+
+    /// Generate an interactive HTML ring visualization for a specific contract.
+    pub async fn write_ring_visualization_for_contract<P: AsRef<Path>>(
+        &self,
+        output_path: P,
+        contract_id: &str,
+    ) -> Result<()> {
+        let contract_id_owned = contract_id.to_string();
+        let contract_key = ContractKey::from_id(contract_id_owned.clone()).map_err(|err| {
+            Error::Other(anyhow::anyhow!(
+                "invalid contract key {}: {}",
+                contract_id,
+                err
+            ))
+        })?;
+        self.write_ring_visualization_internal(
+            output_path,
+            Some((&contract_key, contract_id_owned.as_str())),
+        )
+        .await
+    }
+
+    async fn write_ring_visualization_internal<P: AsRef<Path>>(
+        &self,
+        output_path: P,
+        contract: Option<(&ContractKey, &str)>,
+    ) -> Result<()> {
+        let (snapshots, contract_viz) = if let Some((contract_key, contract_id)) = contract {
+            let snapshots = self.collect_ring_snapshot(Some(contract_key)).await?;
+            let caching_peers = snapshots
+                .iter()
+                .filter(|peer| {
+                    peer.contract
+                        .as_ref()
+                        .map(|state| state.stores_contract)
+                        .unwrap_or(false)
+                })
+                .map(|peer| peer.id.clone())
+                .collect::<Vec<_>>();
+            let contract_location = contract_location_from_key(contract_key);
+            let flow = self.collect_contract_flow(contract_id, &snapshots)?;
+            let viz = ContractVizData {
+                key: contract_id.to_string(),
+                location: contract_location,
+                caching_peers,
+                put: OperationPath {
+                    edges: flow.put_edges,
+                    completion_peer: flow.put_completion_peer,
+                },
+                update: OperationPath {
+                    edges: flow.update_edges,
+                    completion_peer: flow.update_completion_peer,
+                },
+                errors: flow.errors,
+            };
+            (snapshots, Some(viz))
+        } else {
+            (self.collect_ring_snapshot(None).await?, None)
+        };
+
+        let metrics = compute_ring_metrics(&snapshots);
+        let payload = json!({
+            "generated_at": Utc::now().to_rfc3339(),
+            "run_root": self.run_root.display().to_string(),
+            "nodes": snapshots,
+            "metrics": metrics,
+            "contract": contract_viz,
+        });
+        let data_json = serde_json::to_string(&payload).map_err(|e| Error::Other(e.into()))?;
+        let html = render_ring_template(&data_json);
+        let out_path = output_path.as_ref();
+        if let Some(parent) = out_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(out_path, html)?;
+        tracing::info!(path = %out_path.display(), "Wrote ring visualization");
+        Ok(())
+    }
+
+    fn collect_contract_flow(
+        &self,
+        contract_id: &str,
+        peers: &[RingPeerSnapshot],
+    ) -> Result<ContractFlowData> {
+        let mut data = ContractFlowData::default();
+        let logs = self.read_logs()?;
+        for entry in logs {
+            if !entry.message.contains(contract_id) {
+                continue;
+            }
+            if let Some(caps) = PUT_REQUEST_RE.captures(&entry.message) {
+                if &caps["key"] != contract_id {
+                    continue;
+                }
+                data.put_edges.push(ContractOperationEdge {
+                    from: caps["from"].to_string(),
+                    to: caps["to"].to_string(),
+                    timestamp: entry.timestamp.map(|ts| ts.to_rfc3339()),
+                    log_level: entry.level.clone(),
+                    log_source: Some(entry.peer_id.clone()),
+                    message: entry.message.clone(),
+                });
+                continue;
+            }
+            if let Some(caps) = PUT_COMPLETION_RE.captures(&entry.message) {
+                if &caps["key"] != contract_id {
+                    continue;
+                }
+                data.put_completion_peer = Some(caps["peer"].to_string());
+                continue;
+            }
+            if let Some(caps) = UPDATE_PROPAGATION_RE.captures(&entry.message) {
+                if &caps["contract"] != contract_id {
+                    continue;
+                }
+                let from = caps["from"].to_string();
+                let ts = entry.timestamp.map(|ts| ts.to_rfc3339());
+                let level = entry.level.clone();
+                let source = Some(entry.peer_id.clone());
+                let targets = caps["targets"].trim();
+                if !targets.is_empty() {
+                    for prefix in targets.split(',').filter(|s| !s.is_empty()) {
+                        if let Some(resolved) = resolve_peer_id(prefix, peers) {
+                            data.update_edges.push(ContractOperationEdge {
+                                from: from.clone(),
+                                to: resolved,
+                                timestamp: ts.clone(),
+                                log_level: level.clone(),
+                                log_source: source.clone(),
+                                message: entry.message.clone(),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+            if let Some(caps) = UPDATE_NO_TARGETS_RE.captures(&entry.message) {
+                if &caps["contract"] != contract_id {
+                    continue;
+                }
+                data.errors.push(entry.message.clone());
+                continue;
+            }
+            if entry.message.contains("update will not propagate") {
+                data.errors.push(entry.message.clone());
+            }
+        }
+        Ok(data)
+    }
 }
 
 impl TestNetwork {
@@ -207,6 +488,126 @@ impl TestNetwork {
     }
 }
 
+/// Snapshot describing diagnostics collected across the network at a moment in time.
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkDiagnosticsSnapshot {
+    pub collected_at: chrono::DateTime<Utc>,
+    pub peers: Vec<PeerDiagnosticsSnapshot>,
+}
+
+/// Diagnostic information for a single peer.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerDiagnosticsSnapshot {
+    pub peer_id: String,
+    pub is_gateway: bool,
+    pub ws_url: String,
+    pub location: Option<String>,
+    pub listening_address: Option<String>,
+    pub connected_peer_ids: Vec<String>,
+    pub connected_peers_detailed: Vec<ConnectedPeerInfo>,
+    pub active_connections: Option<usize>,
+    pub system_metrics: Option<SystemMetrics>,
+    pub error: Option<String>,
+}
+
+impl PeerDiagnosticsSnapshot {
+    fn new(peer: &TestPeer) -> Self {
+        Self {
+            peer_id: peer.id().to_string(),
+            is_gateway: peer.is_gateway(),
+            ws_url: peer.ws_url(),
+            location: None,
+            listening_address: None,
+            connected_peer_ids: Vec::new(),
+            connected_peers_detailed: Vec::new(),
+            active_connections: None,
+            system_metrics: None,
+            error: None,
+        }
+    }
+}
+
+/// Snapshot describing a peer's ring metadata and adjacency.
+#[derive(Debug, Clone, Serialize)]
+pub struct RingPeerSnapshot {
+    pub id: String,
+    pub is_gateway: bool,
+    pub ws_port: u16,
+    pub network_port: u16,
+    pub network_address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<f64>,
+    pub connections: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<PeerContractStatus>,
+}
+
+/// Contract-specific status for a peer when a contract key is provided.
+#[derive(Debug, Clone, Serialize)]
+pub struct PeerContractStatus {
+    pub stores_contract: bool,
+    pub subscribed_locally: bool,
+    pub subscriber_peer_ids: Vec<String>,
+    pub subscriber_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractVizData {
+    pub key: String,
+    pub location: f64,
+    pub caching_peers: Vec<String>,
+    pub put: OperationPath,
+    pub update: OperationPath,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OperationPath {
+    pub edges: Vec<ContractOperationEdge>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_peer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractOperationEdge {
+    pub from: String,
+    pub to: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_source: Option<String>,
+    pub message: String,
+}
+
+/// Aggregated metrics that help reason about small-world properties.
+#[derive(Debug, Clone, Serialize)]
+pub struct RingVizMetrics {
+    pub node_count: usize,
+    pub gateway_count: usize,
+    pub edge_count: usize,
+    pub average_degree: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_ring_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_ring_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ring_distance: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pct_edges_under_5pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pct_edges_under_10pct: Option<f64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub distance_histogram: Vec<RingDistanceBucket>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RingDistanceBucket {
+    pub upper_bound: f64,
+    pub count: usize,
+}
+
 /// Network topology information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkTopology {
@@ -227,4 +628,799 @@ pub struct PeerInfo {
 pub struct Connection {
     pub from: String,
     pub to: String,
+}
+
+#[derive(Default)]
+struct ContractFlowData {
+    put_edges: Vec<ContractOperationEdge>,
+    put_completion_peer: Option<String>,
+    update_edges: Vec<ContractOperationEdge>,
+    update_completion_peer: Option<String>,
+    errors: Vec<String>,
+}
+
+async fn query_ring_snapshot(
+    peer: &TestPeer,
+    contract_key: Option<&ContractKey>,
+) -> Result<RingPeerSnapshot> {
+    use tokio_tungstenite::connect_async;
+
+    let url = format!("{}?encodingProtocol=native", peer.ws_url());
+    let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(5), connect_async(&url))
+        .await
+        .map_err(|_| Error::ConnectivityFailed(format!("Timeout connecting to {}", peer.id())))?
+        .map_err(|e| {
+            Error::ConnectivityFailed(format!("Failed to connect to {}: {}", peer.id(), e))
+        })?;
+
+    let mut client = WebApi::start(ws_stream);
+    let diag_config = if let Some(key) = contract_key {
+        NodeDiagnosticsConfig {
+            include_node_info: true,
+            include_network_info: true,
+            include_subscriptions: true,
+            contract_keys: vec![key.clone()],
+            include_system_metrics: false,
+            include_detailed_peer_info: true,
+            include_subscriber_peer_ids: true,
+        }
+    } else {
+        NodeDiagnosticsConfig::basic_status()
+    };
+
+    client
+        .send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
+            config: diag_config,
+        }))
+        .await
+        .map_err(|e| {
+            Error::ConnectivityFailed(format!(
+                "Failed to send diagnostics to {}: {}",
+                peer.id(),
+                e
+            ))
+        })?;
+
+    let response = tokio::time::timeout(Duration::from_secs(5), client.recv())
+        .await
+        .map_err(|_| {
+            Error::ConnectivityFailed(format!(
+                "Timeout waiting for diagnostics response from {}",
+                peer.id()
+            ))
+        })?;
+
+    let diag = match response {
+        Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag))) => diag,
+        Ok(other) => {
+            client.disconnect("ring snapshot error").await;
+            return Err(Error::ConnectivityFailed(format!(
+                "Unexpected diagnostics response from {}: {:?}",
+                peer.id(),
+                other
+            )));
+        }
+        Err(e) => {
+            client.disconnect("ring snapshot error").await;
+            return Err(Error::ConnectivityFailed(format!(
+                "Diagnostics query failed for {}: {}",
+                peer.id(),
+                e
+            )));
+        }
+    };
+
+    let node_info = diag.node_info.ok_or_else(|| {
+        Error::ConnectivityFailed(format!("{} did not return node_info", peer.id()))
+    })?;
+
+    let location = node_info
+        .location
+        .as_deref()
+        .and_then(|value| value.parse::<f64>().ok());
+
+    let mut connections: Vec<String> = diag
+        .connected_peers_detailed
+        .into_iter()
+        .map(|info| info.peer_id)
+        .collect();
+
+    if connections.is_empty() {
+        if let Some(network_info) = diag.network_info {
+            connections = network_info
+                .connected_peers
+                .into_iter()
+                .map(|(peer_id, _)| peer_id)
+                .collect();
+        }
+    }
+
+    connections.retain(|conn| conn != &node_info.peer_id);
+    connections.sort();
+    connections.dedup();
+
+    let contract_status = contract_key.and_then(|key| {
+        let (stores_contract, subscriber_count, subscriber_peer_ids) =
+            if let Some(state) = diag.contract_states.get(key) {
+                (
+                    true,
+                    state.subscribers as usize,
+                    state.subscriber_peer_ids.clone(),
+                )
+            } else {
+                (false, 0, Vec::new())
+            };
+        let subscribed_locally = diag
+            .subscriptions
+            .iter()
+            .any(|sub| &sub.contract_key == key);
+        if stores_contract || subscribed_locally {
+            Some(PeerContractStatus {
+                stores_contract,
+                subscribed_locally,
+                subscriber_peer_ids,
+                subscriber_count,
+            })
+        } else {
+            None
+        }
+    });
+
+    client.disconnect("ring snapshot complete").await;
+
+    Ok(RingPeerSnapshot {
+        id: node_info.peer_id,
+        is_gateway: node_info.is_gateway,
+        ws_port: peer.ws_port,
+        network_port: peer.network_port,
+        network_address: peer.network_address.clone(),
+        location,
+        connections,
+        contract: contract_status,
+    })
+}
+
+fn compute_ring_metrics(nodes: &[RingPeerSnapshot]) -> RingVizMetrics {
+    let node_count = nodes.len();
+    let gateway_count = nodes.iter().filter(|peer| peer.is_gateway).count();
+    let mut total_degree = 0usize;
+    let mut unique_edges: HashSet<(String, String)> = HashSet::new();
+
+    for node in nodes {
+        total_degree += node.connections.len();
+        for neighbor in &node.connections {
+            if neighbor == &node.id {
+                continue;
+            }
+            let edge = if node.id < *neighbor {
+                (node.id.clone(), neighbor.clone())
+            } else {
+                (neighbor.clone(), node.id.clone())
+            };
+            unique_edges.insert(edge);
+        }
+    }
+
+    let average_degree = if node_count == 0 {
+        0.0
+    } else {
+        total_degree as f64 / node_count as f64
+    };
+
+    let mut location_lookup = HashMap::new();
+    for node in nodes {
+        if let Some(loc) = node.location {
+            location_lookup.insert(node.id.clone(), loc);
+        }
+    }
+
+    let mut distances = Vec::new();
+    for (a, b) in &unique_edges {
+        if let (Some(loc_a), Some(loc_b)) = (location_lookup.get(a), location_lookup.get(b)) {
+            let mut distance = (loc_a - loc_b).abs();
+            if distance > 0.5 {
+                distance = 1.0 - distance;
+            }
+            distances.push(distance);
+        }
+    }
+
+    let average_ring_distance = if distances.is_empty() {
+        None
+    } else {
+        Some(distances.iter().sum::<f64>() / distances.len() as f64)
+    };
+    let min_ring_distance = distances.iter().cloned().reduce(f64::min);
+    let max_ring_distance = distances.iter().cloned().reduce(f64::max);
+    let pct_edges_under_5pct = calculate_percentage(&distances, 0.05);
+    let pct_edges_under_10pct = calculate_percentage(&distances, 0.10);
+
+    let mut distance_histogram = Vec::new();
+    let bucket_bounds = [0.02, 0.05, 0.1, 0.2, 0.3, 0.5];
+    for bound in bucket_bounds {
+        let count = distances.iter().filter(|d| **d <= bound).count();
+        distance_histogram.push(RingDistanceBucket {
+            upper_bound: bound,
+            count,
+        });
+    }
+
+    RingVizMetrics {
+        node_count,
+        gateway_count,
+        edge_count: unique_edges.len(),
+        average_degree,
+        average_ring_distance,
+        min_ring_distance,
+        max_ring_distance,
+        pct_edges_under_5pct,
+        pct_edges_under_10pct,
+        distance_histogram,
+    }
+}
+
+fn calculate_percentage(distances: &[f64], threshold: f64) -> Option<f64> {
+    if distances.is_empty() {
+        return None;
+    }
+    let matching = distances.iter().filter(|value| **value < threshold).count();
+    Some((matching as f64 / distances.len() as f64) * 100.0)
+}
+
+fn resolve_peer_id(prefix: &str, peers: &[RingPeerSnapshot]) -> Option<String> {
+    let needle = prefix.trim().trim_matches(|c| c == '"' || c == '\'');
+    peers
+        .iter()
+        .find(|peer| peer.id.starts_with(needle))
+        .map(|peer| peer.id.clone())
+}
+
+fn contract_location_from_key(key: &ContractKey) -> f64 {
+    let mut value = 0.0;
+    let mut divisor = 256.0;
+    for byte in key.as_bytes() {
+        value += f64::from(*byte) / divisor;
+        divisor *= 256.0;
+    }
+    value.fract()
+}
+
+static PUT_REQUEST_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Requesting put for contract (?P<key>\S+) from (?P<from>\S+) to (?P<to>\S+)")
+        .expect("valid regex")
+});
+static PUT_COMPLETION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"Peer completed contract value put,.*key: (?P<key>\S+),.*this_peer: (?P<peer>\S+)")
+        .expect("valid regex")
+});
+static UPDATE_PROPAGATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"UPDATE_PROPAGATION: contract=(?P<contract>\S+) from=(?P<from>\S+) targets=(?P<targets>[^ ]*)\s+count=",
+    )
+    .expect("valid regex")
+});
+static UPDATE_NO_TARGETS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"UPDATE_PROPAGATION: contract=(?P<contract>\S+) from=(?P<from>\S+) NO_TARGETS")
+        .expect("valid regex")
+});
+
+const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Freenet Ring Topology</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Inter", "Helvetica Neue", Arial, sans-serif;
+    }
+    body {
+      background: #020617;
+      color: #e2e8f0;
+      margin: 0;
+      padding: 32px;
+      display: flex;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    #container {
+      max-width: 1000px;
+      width: 100%;
+      background: #0f172a;
+      border-radius: 18px;
+      padding: 28px 32px 40px;
+      box-shadow: 0 40px 120px rgba(2, 6, 23, 0.85);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 26px;
+      letter-spacing: 0.4px;
+      color: #f8fafc;
+    }
+    #meta {
+      margin: 0 0 20px;
+      color: #94a3b8;
+      font-size: 14px;
+    }
+    canvas {
+      width: 100%;
+      max-width: 900px;
+      height: auto;
+      background: radial-gradient(circle, #020617 0%, #0f172a 70%, #020617 100%);
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.1);
+      display: block;
+      margin: 0 auto 24px;
+    }
+    #metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+    #metrics div {
+      background: #1e293b;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.15);
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      margin-bottom: 24px;
+      font-size: 14px;
+      color: #cbd5f5;
+    }
+    .legend span {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .legend .line {
+      width: 30px;
+      height: 6px;
+      border-radius: 3px;
+      display: inline-block;
+    }
+    .legend .put-line {
+      background: #22c55e;
+    }
+    .legend .update-line {
+      background: #f59e0b;
+    }
+    .legend .contract-dot {
+      background: #a855f7;
+      box-shadow: 0 0 6px rgba(168, 85, 247, 0.7);
+    }
+    .legend .cached-dot {
+      background: #38bdf8;
+    }
+    .legend .peer-dot {
+      background: #64748b;
+    }
+    .legend .gateway-dot {
+      background: #f97316;
+    }
+    .dot {
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    #contract-info {
+      background: rgba(15, 23, 42, 0.7);
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.15);
+      padding: 14px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: #cbd5f5;
+    }
+    #contract-info h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      color: #f8fafc;
+    }
+    #contract-info .op-block {
+      margin-top: 10px;
+    }
+    #contract-info ol {
+      padding-left: 20px;
+      margin: 6px 0;
+    }
+    #contract-info .errors {
+      margin-top: 10px;
+      color: #f97316;
+    }
+    #peer-list {
+      border-top: 1px solid rgba(148, 163, 184, 0.15);
+      padding-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 14px;
+      font-size: 13px;
+    }
+    .peer {
+      background: rgba(15, 23, 42, 0.75);
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+    .peer strong {
+      display: block;
+      font-size: 13px;
+      color: #f1f5f9;
+      margin-bottom: 6px;
+      word-break: break-all;
+    }
+    .peer span {
+      display: block;
+      color: #94a3b8;
+    }
+  </style>
+</head>
+<body>
+  <div id="container">
+    <h1>Freenet Ring Topology</h1>
+    <p id="meta"></p>
+    <canvas id="ring" width="900" height="900"></canvas>
+    <div id="metrics"></div>
+    <div class="legend">
+      <span><span class="dot peer-dot"></span>Peer</span>
+      <span><span class="dot gateway-dot"></span>Gateway</span>
+      <span><span class="dot cached-dot"></span>Cached peer</span>
+      <span><span class="dot contract-dot"></span>Contract</span>
+      <span><span class="line put-line"></span>PUT path</span>
+      <span><span class="line update-line"></span>UPDATE path</span>
+      <span><span class="dot" style="background:#475569"></span>Connection</span>
+    </div>
+    <div id="contract-info"></div>
+    <div id="peer-list"></div>
+  </div>
+  <script>
+    const vizData = __DATA__;
+    const contractData = vizData.contract ?? null;
+    const metaEl = document.getElementById("meta");
+    metaEl.textContent = vizData.nodes.length
+      ? `Captured ${vizData.nodes.length} nodes · ${vizData.metrics.edge_count} edges · Generated ${vizData.generated_at} · Run root: ${vizData.run_root}`
+      : "No peers reported diagnostics data.";
+
+    const metricsEl = document.getElementById("metrics");
+    const fmtNumber = (value, digits = 2) => (typeof value === "number" ? value.toFixed(digits) : "n/a");
+    const fmtPercent = (value, digits = 1) => (typeof value === "number" ? `${value.toFixed(digits)}%` : "n/a");
+
+    const histogram = vizData.metrics.distance_histogram ?? [];
+    const maxBucketCount = histogram.reduce((acc, b) => Math.max(acc, b.count), 0);
+    const histoHtml = histogram.length
+      ? `<div style="grid-column: 1 / -1; margin-top: 8px;">
+            <strong>Ring distance histogram (cumulative)</strong>
+            <div style="display:flex; flex-direction:column; gap:4px; margin-top:6px;">
+              ${histogram
+                .map((b) => {
+                  const widthPct = maxBucketCount > 0 ? (b.count / maxBucketCount) * 100 : 0;
+                  return `<div style="display:flex; align-items:center; gap:8px;">
+                    <div style="width:180px; color:#94a3b8;">&le; ${(b.upper_bound * 100).toFixed(1)}% ring</div>
+                    <div style="flex:1; height:8px; background:rgba(148,163,184,0.2); border-radius:4px; position:relative;">
+                      <span style="display:block; height:8px; width:${widthPct}%; background:#38bdf8; border-radius:4px;"></span>
+                    </div>
+                    <span style="width:50px; text-align:right; color:#cbd5f5;">${b.count}</span>
+                  </div>`;
+                })
+                .join("")}
+            </div>
+         </div>`
+      : "";
+
+    metricsEl.innerHTML = `
+      <div><strong>Total nodes</strong><br/>${vizData.metrics.node_count} (gateways: ${vizData.metrics.gateway_count})</div>
+      <div><strong>Edges</strong><br/>${vizData.metrics.edge_count}</div>
+      <div><strong>Average degree</strong><br/>${fmtNumber(vizData.metrics.average_degree)}</div>
+      <div><strong>Average ring distance</strong><br/>${fmtNumber(vizData.metrics.average_ring_distance, 3)}</div>
+      <div><strong>Min / Max ring distance</strong><br/>${fmtNumber(vizData.metrics.min_ring_distance, 3)} / ${fmtNumber(vizData.metrics.max_ring_distance, 3)}</div>
+      <div><strong>Edges &lt;5% / &lt;10%</strong><br/>${fmtPercent(vizData.metrics.pct_edges_under_5pct)} / ${fmtPercent(vizData.metrics.pct_edges_under_10pct)}</div>
+      ${histoHtml}
+    `;
+
+    const peersEl = document.getElementById("peer-list");
+    peersEl.innerHTML = vizData.nodes
+      .map((node) => {
+        const role = node.is_gateway ? "Gateway" : "Peer";
+        const loc = typeof node.location === "number" ? node.location.toFixed(6) : "unknown";
+        return `<div class="peer">
+          <strong>${node.id}</strong>
+          <span>${role}</span>
+          <span>Location: ${loc}</span>
+          <span>Degree: ${node.connections.length}</span>
+        </div>`;
+      })
+      .join("");
+
+    const contractInfoEl = document.getElementById("contract-info");
+    const canvas = document.getElementById("ring");
+    const ctx = canvas.getContext("2d");
+    const width = canvas.width;
+    const height = canvas.height;
+    const center = { x: width / 2, y: height / 2 };
+    const radius = Math.min(width, height) * 0.37;
+    const cachingPeers = new Set(contractData?.caching_peers ?? []);
+    const putEdges = contractData?.put?.edges ?? [];
+    const updateEdges = contractData?.update?.edges ?? [];
+    const contractLocation = typeof (contractData?.location) === "number" ? contractData.location : null;
+
+    function shortId(id) {
+      return id.slice(-6);
+    }
+
+    function angleFromLocation(location) {
+      return (location % 1) * Math.PI * 2;
+    }
+
+    function polarToCartesian(angle, r = radius) {
+      const theta = angle - Math.PI / 2;
+      return {
+        x: center.x + r * Math.cos(theta),
+        y: center.y + r * Math.sin(theta),
+      };
+    }
+
+    const nodes = vizData.nodes.map((node, idx) => {
+      const angle = typeof node.location === "number"
+        ? angleFromLocation(node.location)
+        : (idx / vizData.nodes.length) * Math.PI * 2;
+      const coords = polarToCartesian(angle);
+      return {
+        ...node,
+        angle,
+        x: coords.x,
+        y: coords.y,
+      };
+    });
+    const nodeMap = new Map(nodes.map((node) => [node.id, node]));
+
+    function drawRingBase() {
+      ctx.save();
+      ctx.strokeStyle = "#475569";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(center.x, center.y, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([4, 8]);
+      ctx.strokeStyle = "rgba(148,163,184,0.3)";
+      [0, 0.25, 0.5, 0.75].forEach((loc) => {
+        const angle = angleFromLocation(loc);
+        const inner = polarToCartesian(angle, radius * 0.9);
+        const outer = polarToCartesian(angle, radius * 1.02);
+        ctx.beginPath();
+        ctx.moveTo(inner.x, inner.y);
+        ctx.lineTo(outer.x, outer.y);
+        ctx.stroke();
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "11px 'Fira Code', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(loc.toFixed(2), outer.x, outer.y - 6);
+      });
+      ctx.restore();
+    }
+
+    function drawConnections() {
+      ctx.save();
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.35)";
+      ctx.lineWidth = 1.2;
+      const drawn = new Set();
+      nodes.forEach((node) => {
+        node.connections.forEach((neighborId) => {
+          const neighbor = nodeMap.get(neighborId);
+          if (!neighbor) return;
+          const key = node.id < neighborId ? `${node.id}|${neighborId}` : `${neighborId}|${node.id}`;
+          if (drawn.has(key)) return;
+          drawn.add(key);
+          ctx.beginPath();
+          ctx.moveTo(node.x, node.y);
+          ctx.lineTo(neighbor.x, neighbor.y);
+          ctx.stroke();
+        });
+      });
+      ctx.restore();
+    }
+
+    function drawContractMarker() {
+      if (typeof contractLocation !== "number") return;
+      const pos = polarToCartesian(angleFromLocation(contractLocation));
+      ctx.save();
+      ctx.fillStyle = "#a855f7";
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = "#f3e8ff";
+      ctx.stroke();
+      ctx.fillStyle = "#f3e8ff";
+      ctx.font = "10px 'Fira Code', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("contract", pos.x, pos.y - 16);
+      ctx.restore();
+    }
+
+    function drawPeers() {
+      nodes.forEach((node) => {
+        const baseColor = node.is_gateway ? "#f97316" : "#64748b";
+        const fill = cachingPeers.has(node.id) ? "#38bdf8" : baseColor;
+        ctx.save();
+        ctx.beginPath();
+        ctx.fillStyle = fill;
+        ctx.arc(node.x, node.y, 6.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.lineWidth = 1.6;
+        ctx.strokeStyle = "#0f172a";
+        ctx.stroke();
+        ctx.fillStyle = "#f8fafc";
+        ctx.font = "12px 'Fira Code', monospace";
+        ctx.textAlign = "center";
+        ctx.fillText(shortId(node.id), node.x, node.y - 14);
+        const locText = typeof node.location === "number" ? node.location.toFixed(3) : "n/a";
+        ctx.fillStyle = "#94a3b8";
+        ctx.font = "10px 'Fira Code', monospace";
+        ctx.fillText(locText, node.x, node.y + 20);
+        ctx.restore();
+      });
+    }
+
+    function drawOperationEdges(edges, color, dashed = false) {
+      if (!edges.length) return;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 3;
+      if (dashed) ctx.setLineDash([10, 8]);
+      edges.forEach((edge, idx) => {
+        const from = nodeMap.get(edge.from);
+        const to = nodeMap.get(edge.to);
+        if (!from || !to) return;
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        ctx.stroke();
+        drawArrowhead(from, to, color);
+        const midX = (from.x + to.x) / 2;
+        const midY = (from.y + to.y) / 2;
+        ctx.fillStyle = color;
+        ctx.font = "11px 'Fira Code', monospace";
+        ctx.fillText(`#${idx + 1}`, midX, midY - 4);
+      });
+      ctx.restore();
+    }
+
+    function drawArrowhead(from, to, color) {
+      const angle = Math.atan2(to.y - from.y, to.x - from.x);
+      const length = 12;
+      const spread = Math.PI / 6;
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.moveTo(to.x, to.y);
+      ctx.lineTo(
+        to.x - length * Math.cos(angle - spread),
+        to.y - length * Math.sin(angle - spread)
+      );
+      ctx.lineTo(
+        to.x - length * Math.cos(angle + spread),
+        to.y - length * Math.sin(angle + spread)
+      );
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function renderOperationList(title, edges) {
+      if (!edges.length) {
+        return `<div class="op-block"><strong>${title}:</strong> none recorded</div>`;
+      }
+      const items = edges
+        .map((edge, idx) => {
+          const ts = edge.timestamp
+            ? new Date(edge.timestamp).toLocaleTimeString()
+            : "no-ts";
+          return `<li>#${idx + 1}: ${shortId(edge.from)} → ${shortId(edge.to)} (${ts})</li>`;
+        })
+        .join("");
+      return `<div class="op-block"><strong>${title}:</strong><ol>${items}</ol></div>`;
+    }
+
+    function renderContractInfo(data) {
+      if (!data) {
+        contractInfoEl.textContent = "No contract-specific data collected for this snapshot.";
+        return;
+      }
+      const errors = data.errors?.length
+        ? `<div class="errors"><strong>Notable events:</strong><ul>${data.errors
+            .map((msg) => `<li>${msg}</li>`)
+            .join("")}</ul></div>`
+        : "";
+      const putSummary = renderOperationList("PUT path", data.put.edges);
+      const updateSummary = renderOperationList("UPDATE path", data.update.edges);
+      contractInfoEl.innerHTML = `
+        <h2>Contract ${data.key}</h2>
+        <div><strong>Cached peers:</strong> ${data.caching_peers.length}</div>
+        <div><strong>PUT completion:</strong> ${
+          data.put.completion_peer ?? "pending"
+        }</div>
+        <div><strong>UPDATE completion:</strong> ${
+          data.update.completion_peer ?? "pending"
+        }</div>
+        ${putSummary}
+        ${updateSummary}
+        ${errors}
+      `;
+    }
+
+    renderContractInfo(contractData);
+
+    if (nodes.length) {
+      drawRingBase();
+      drawConnections();
+      drawContractMarker();
+      drawOperationEdges(putEdges, "#22c55e", false);
+      drawOperationEdges(updateEdges, "#f59e0b", true);
+      drawPeers();
+    } else {
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "16px Inter, sans-serif";
+      ctx.fillText("No diagnostics available to render ring.", center.x - 140, center.y);
+    }
+  </script>
+</body>
+</html>
+"###;
+
+fn render_ring_template(data_json: &str) -> String {
+    HTML_TEMPLATE.replace("__DATA__", data_json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_ring_metrics, RingPeerSnapshot};
+
+    #[test]
+    fn ring_metrics_basic() {
+        let nodes = vec![
+            RingPeerSnapshot {
+                id: "a".into(),
+                is_gateway: false,
+                ws_port: 0,
+                network_port: 0,
+                network_address: "127.1.0.1".into(),
+                location: Some(0.1),
+                connections: vec!["b".into(), "c".into()],
+                contract: None,
+            },
+            RingPeerSnapshot {
+                id: "b".into(),
+                is_gateway: false,
+                ws_port: 0,
+                network_port: 0,
+                network_address: "127.2.0.1".into(),
+                location: Some(0.2),
+                connections: vec!["a".into()],
+                contract: None,
+            },
+            RingPeerSnapshot {
+                id: "c".into(),
+                is_gateway: true,
+                ws_port: 0,
+                network_port: 0,
+                network_address: "127.3.0.1".into(),
+                location: Some(0.8),
+                connections: vec!["a".into()],
+                contract: None,
+            },
+        ];
+
+        let metrics = compute_ring_metrics(&nodes);
+        assert_eq!(metrics.node_count, 3);
+        assert_eq!(metrics.gateway_count, 1);
+        assert_eq!(metrics.edge_count, 2);
+        assert!((metrics.average_degree - (4.0 / 3.0)).abs() < f64::EPSILON);
+        assert!(metrics.average_ring_distance.is_some());
+    }
 }

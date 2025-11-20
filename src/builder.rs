@@ -2,12 +2,16 @@ use crate::{
     binary::FreenetBinary,
     network::TestNetwork,
     peer::{get_free_port, TestPeer},
+    process::{self, PeerProcess},
+    remote::{PeerLocation, RemoteMachine},
     Error, Result,
 };
 use chrono::Utc;
+use std::collections::HashMap;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 struct GatewayInfo {
@@ -24,6 +28,10 @@ pub struct NetworkBuilder {
     connectivity_timeout: Duration,
     preserve_data_on_failure: bool,
     preserve_data_on_success: bool,
+    peer_locations: HashMap<usize, PeerLocation>,
+    default_location: PeerLocation,
+    min_connections: Option<usize>,
+    max_connections: Option<usize>,
 }
 
 impl Default for NetworkBuilder {
@@ -42,6 +50,10 @@ impl NetworkBuilder {
             connectivity_timeout: Duration::from_secs(30),
             preserve_data_on_failure: false,
             preserve_data_on_success: false,
+            peer_locations: HashMap::new(),
+            default_location: PeerLocation::Local,
+            min_connections: None,
+            max_connections: None,
         }
     }
 
@@ -75,6 +87,18 @@ impl NetworkBuilder {
         self
     }
 
+    /// Override min connections target for all peers.
+    pub fn min_connections(mut self, min: usize) -> Self {
+        self.min_connections = Some(min);
+        self
+    }
+
+    /// Override max connections target for all peers.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
     /// Preserve peer data directories in `/tmp` when network startup fails
     pub fn preserve_temp_dirs_on_failure(mut self, preserve: bool) -> Self {
         self.preserve_data_on_failure = preserve;
@@ -84,6 +108,30 @@ impl NetworkBuilder {
     /// Preserve peer data directories in `/tmp` even when the network boots successfully.
     pub fn preserve_temp_dirs_on_success(mut self, preserve: bool) -> Self {
         self.preserve_data_on_success = preserve;
+        self
+    }
+
+    /// Set the location for a specific peer (by index)
+    /// Index 0 is the first gateway, subsequent indices are regular peers
+    pub fn peer_location(mut self, index: usize, location: PeerLocation) -> Self {
+        self.peer_locations.insert(index, location);
+        self
+    }
+
+    /// Set the default location for all peers not explicitly configured
+    pub fn default_location(mut self, location: PeerLocation) -> Self {
+        self.default_location = location;
+        self
+    }
+
+    /// Convenience method to set locations for multiple remote machines
+    /// Distributes peers across the provided machines in round-robin fashion
+    pub fn distribute_across_remotes(mut self, machines: Vec<RemoteMachine>) -> Self {
+        let total_peers = self.gateways + self.peers;
+        for (idx, machine) in (0..total_peers).zip(machines.iter().cycle()) {
+            self.peer_locations
+                .insert(idx, PeerLocation::Remote(machine.clone()));
+        }
         self
     }
 
@@ -122,7 +170,7 @@ impl NetworkBuilder {
         let gateway_info: Vec<_> = gateways
             .iter()
             .map(|gw| GatewayInfo {
-                address: format!("127.0.0.1:{}", gw.network_port),
+                address: format!("{}:{}", gw.network_address, gw.network_port),
                 public_key_path: gw
                     .public_key_path
                     .clone()
@@ -226,13 +274,40 @@ impl NetworkBuilder {
         gateway_info: &[GatewayInfo],
         run_root: &Path,
     ) -> Result<TestPeer> {
-        let ws_port = get_free_port()?;
-        let network_port = get_free_port()?;
+        // Get location for this peer
+        let location = self
+            .peer_locations
+            .get(&index)
+            .cloned()
+            .unwrap_or_else(|| self.default_location.clone());
+
         let id = if is_gateway {
             format!("gw{}", index)
         } else {
             format!("peer{}", index)
         };
+
+        // Determine network address based on location
+        let network_address = match &location {
+            PeerLocation::Local => {
+                let addr_index = index as u32;
+                let second_octet = ((addr_index / 256) % 254 + 1) as u8;
+                let third_octet = (addr_index % 256) as u8;
+                Ipv4Addr::new(127, second_octet, third_octet, 1).to_string()
+            }
+            PeerLocation::Remote(remote) => {
+                // Discover the public IP address of the remote machine
+                remote.discover_public_address()?
+            }
+        };
+
+        // For local peers, allocate ports locally
+        // For remote peers, use port 0 (let remote OS allocate)
+        let (ws_port, network_port) = match &location {
+            PeerLocation::Local => (get_free_port()?, get_free_port()?),
+            PeerLocation::Remote(_) => (0, 0), // Will be allocated on remote
+        };
+
         let data_dir = create_peer_dir(run_root, &id)?;
 
         tracing::debug!(
@@ -253,57 +328,164 @@ impl NetworkBuilder {
             (None, None)
         };
 
-        // Build command
-        let mut cmd = Command::new(binary_path);
-        cmd.arg("network")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .arg("--config-dir")
-            .arg(&data_dir)
-            .arg("--ws-api-port")
-            .arg(ws_port.to_string())
-            .arg("--network-port")
-            .arg(network_port.to_string())
-            .arg("--skip-load-from-network");
+        // For remote gateways, we need to upload the keypair
+        // For remote regular peers, we need to upload the gateway public keys
+        if let PeerLocation::Remote(remote) = &location {
+            let remote_data_dir = remote.remote_work_dir().join(&id);
+
+            if is_gateway {
+                // Upload keypair to remote
+                if let Some(keypair) = &keypair_path {
+                    let remote_keypair = remote_data_dir.join("keypair.pem");
+                    let remote_pubkey = remote_data_dir.join("public_key.pem");
+                    remote.scp_upload(keypair, remote_keypair.to_str().unwrap())?;
+                    if let Some(pubkey) = &public_key_path {
+                        remote.scp_upload(pubkey, remote_pubkey.to_str().unwrap())?;
+                    }
+                }
+            }
+
+            // Upload gateway public keys for regular peers
+            if !is_gateway {
+                for gw in gateway_info {
+                    let gw_pubkey_name = gw.public_key_path.file_name().ok_or_else(|| {
+                        Error::PeerStartupFailed("Invalid gateway pubkey path".to_string())
+                    })?;
+                    let remote_gw_pubkey = remote_data_dir.join(gw_pubkey_name);
+                    remote.scp_upload(&gw.public_key_path, remote_gw_pubkey.to_str().unwrap())?;
+                }
+            }
+        }
+
+        // Build command arguments (same for local and remote)
+        let mut args = vec![
+            "network".to_string(),
+            "--data-dir".to_string(),
+            match &location {
+                PeerLocation::Local => data_dir.to_string_lossy().to_string(),
+                PeerLocation::Remote(remote) => remote
+                    .remote_work_dir()
+                    .join(&id)
+                    .to_string_lossy()
+                    .to_string(),
+            },
+            "--config-dir".to_string(),
+            match &location {
+                PeerLocation::Local => data_dir.to_string_lossy().to_string(),
+                PeerLocation::Remote(remote) => remote
+                    .remote_work_dir()
+                    .join(&id)
+                    .to_string_lossy()
+                    .to_string(),
+            },
+            "--ws-api-port".to_string(),
+            ws_port.to_string(),
+            "--network-address".to_string(),
+            network_address.clone(),
+            "--network-port".to_string(),
+            network_port.to_string(),
+            "--public-network-address".to_string(),
+            network_address.clone(),
+            "--public-network-port".to_string(),
+            network_port.to_string(),
+            "--skip-load-from-network".to_string(),
+        ];
 
         if is_gateway {
-            cmd.arg("--is-gateway");
-            if let Some(keypair) = &keypair_path {
-                cmd.arg("--transport-keypair").arg(keypair);
+            args.push("--is-gateway".to_string());
+            if keypair_path.is_some() {
+                args.push("--transport-keypair".to_string());
+                let keypair_arg = match &location {
+                    PeerLocation::Local => {
+                        data_dir.join("keypair.pem").to_string_lossy().to_string()
+                    }
+                    PeerLocation::Remote(remote) => remote
+                        .remote_work_dir()
+                        .join(&id)
+                        .join("keypair.pem")
+                        .to_string_lossy()
+                        .to_string(),
+                };
+                args.push(keypair_arg);
             }
-            cmd.arg("--public-network-address").arg("127.0.0.1");
-            cmd.arg("--public-network-port")
-                .arg(network_port.to_string());
         }
 
         // Add gateway addresses for regular peers
         if !is_gateway && !gateway_info.is_empty() {
-            // Write gateways config file with proper TOML format
             let gateways_toml = data_dir.join("gateways.toml");
             let mut content = String::new();
             for gw in gateway_info {
+                let gw_pubkey_path = match &location {
+                    PeerLocation::Local => gw.public_key_path.clone(),
+                    PeerLocation::Remote(remote) => {
+                        let gw_pubkey_name = gw.public_key_path.file_name().ok_or_else(|| {
+                            Error::PeerStartupFailed("Invalid gateway pubkey path".to_string())
+                        })?;
+                        remote.remote_work_dir().join(&id).join(gw_pubkey_name)
+                    }
+                };
                 content.push_str(&format!(
                     "[[gateways]]\n\
                      address = {{ hostname = \"{}\" }}\n\
                      public_key = \"{}\"\n\n",
                     gw.address,
-                    gw.public_key_path.display()
+                    gw_pubkey_path.display()
                 ));
             }
             std::fs::write(&gateways_toml, content)?;
+
+            // Upload gateways.toml to remote if needed
+            if let PeerLocation::Remote(remote) = &location {
+                let remote_gateways_toml = remote.remote_work_dir().join(&id).join("gateways.toml");
+                remote.scp_upload(&gateways_toml, remote_gateways_toml.to_str().unwrap())?;
+            }
         }
 
-        // Set environment and spawn
-        let log_path = data_dir.join("peer.log");
-        let log_file = std::fs::File::create(&log_path)?;
-        cmd.env("RUST_LOG", "info")
-            .env("RUST_BACKTRACE", "1")
-            .stdout(Stdio::from(log_file.try_clone()?))
-            .stderr(Stdio::from(log_file));
+        // Environment variables
+        let env_vars = vec![
+            ("NETWORK_ADDRESS".to_string(), network_address.clone()),
+            (
+                "PUBLIC_NETWORK_ADDRESS".to_string(),
+                network_address.clone(),
+            ),
+            ("PUBLIC_NETWORK_PORT".to_string(), network_port.to_string()),
+        ];
 
-        let process = cmd
-            .spawn()
-            .map_err(|e| Error::PeerStartupFailed(format!("Failed to spawn process: {}", e)))?;
+        if let Some(min_conn) = self.min_connections {
+            args.push("--min-number-of-connections".to_string());
+            args.push(min_conn.to_string());
+        }
+        if let Some(max_conn) = self.max_connections {
+            args.push("--max-number-of-connections".to_string());
+            args.push(max_conn.to_string());
+        }
+
+        // Spawn process (local or remote)
+        let process: Box<dyn PeerProcess + Send> = match &location {
+            PeerLocation::Local => Box::new(process::spawn_local_peer(
+                binary_path,
+                &args,
+                &data_dir,
+                &env_vars,
+            )?),
+            PeerLocation::Remote(remote) => {
+                let remote_data_dir = remote.remote_work_dir().join(&id);
+                let local_cache_dir = run_root.join(format!("{}-cache", id));
+                std::fs::create_dir_all(&local_cache_dir)?;
+
+                Box::new(
+                    process::spawn_remote_peer(
+                        binary_path,
+                        &args,
+                        remote,
+                        &remote_data_dir,
+                        &local_cache_dir,
+                        &env_vars,
+                    )
+                    .await?,
+                )
+            }
+        };
 
         // Give it a moment to start
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -313,9 +495,11 @@ impl NetworkBuilder {
             is_gateway,
             ws_port,
             network_port,
+            network_address,
             data_dir,
-            process: Some(process),
+            process,
             public_key_path,
+            location,
         })
     }
 }

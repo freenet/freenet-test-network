@@ -8,12 +8,18 @@ mod builder;
 mod logs;
 mod network;
 mod peer;
+mod process;
+mod remote;
 
 pub use binary::{BuildProfile, FreenetBinary};
 pub use builder::NetworkBuilder;
 pub use logs::LogEntry;
-pub use network::{NetworkTopology, TestNetwork};
+pub use network::{
+    NetworkDiagnosticsSnapshot, NetworkTopology, PeerDiagnosticsSnapshot, RingPeerSnapshot,
+    RingVizMetrics, TestNetwork,
+};
 pub use peer::TestPeer;
+pub use remote::{PeerLocation, RemoteMachine};
 
 /// Result type used throughout this crate
 pub type Result<T> = std::result::Result<T, Error>;

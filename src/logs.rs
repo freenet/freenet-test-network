@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A log entry from a peer with timestamp
 #[derive(Debug, Clone)]
@@ -161,6 +161,39 @@ fn split_first_token(input: &str) -> Option<(&str, &str)> {
     } else {
         Some((trimmed, ""))
     }
+}
+
+/// Read a single log file and parse its entries
+pub(crate) fn read_log_file(log_path: &Path) -> Result<Vec<LogEntry>> {
+    let peer_id = log_path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+
+    let mut entries = Vec::new();
+
+    if let Ok(file) = File::open(log_path) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            let parsed = parse_log_line(peer_id, &line);
+            let is_new_entry =
+                parsed.timestamp.is_some() || parsed.timestamp_raw.is_some() || entries.is_empty();
+
+            if is_new_entry {
+                entries.push(parsed);
+            } else if let Some(last) = entries.last_mut() {
+                if !parsed.message.is_empty() {
+                    if !last.message.is_empty() {
+                        last.message.push('\n');
+                    }
+                    last.message.push_str(&parsed.message);
+                }
+            }
+        }
+    }
+
+    Ok(entries)
 }
 
 fn strip_ansi_codes(input: &str) -> String {
