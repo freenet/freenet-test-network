@@ -32,6 +32,7 @@ pub struct NetworkBuilder {
     default_location: PeerLocation,
     min_connections: Option<usize>,
     max_connections: Option<usize>,
+    start_stagger: Duration,
 }
 
 impl Default for NetworkBuilder {
@@ -54,6 +55,7 @@ impl NetworkBuilder {
             default_location: PeerLocation::Local,
             min_connections: None,
             max_connections: None,
+            start_stagger: Duration::from_millis(500),
         }
     }
 
@@ -96,6 +98,12 @@ impl NetworkBuilder {
     /// Override max connections target for all peers.
     pub fn max_connections(mut self, max: usize) -> Self {
         self.max_connections = Some(max);
+        self
+    }
+
+    /// Add a delay between starting successive non-gateway peers.
+    pub fn start_stagger(mut self, delay: Duration) -> Self {
+        self.start_stagger = delay;
         self
     }
 
@@ -199,8 +207,8 @@ impl NetworkBuilder {
                 }
             };
             peers.push(peer);
-            if i + 1 < self.peers {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            if i + 1 < self.peers && !self.start_stagger.is_zero() {
+                tokio::time::sleep(self.start_stagger).await;
             }
         }
 
@@ -318,32 +326,21 @@ impl NetworkBuilder {
             network_port
         );
 
-        // Generate keypair if gateway
-        let (keypair_path, public_key_path) = if is_gateway {
-            let keypair = data_dir.join("keypair.pem");
-            let pubkey = data_dir.join("public_key.pem");
-            generate_keypair(&keypair, &pubkey)?;
-            (Some(keypair), Some(pubkey))
-        } else {
-            (None, None)
-        };
+        // Generate a unique transport keypair for every node so identities are distinct.
+        let keypair_path = data_dir.join("keypair.pem");
+        let public_key_path = data_dir.join("public_key.pem");
+        generate_keypair(&keypair_path, &public_key_path)?;
 
         // For remote gateways, we need to upload the keypair
         // For remote regular peers, we need to upload the gateway public keys
         if let PeerLocation::Remote(remote) = &location {
             let remote_data_dir = remote.remote_work_dir().join(&id);
 
-            if is_gateway {
-                // Upload keypair to remote
-                if let Some(keypair) = &keypair_path {
-                    let remote_keypair = remote_data_dir.join("keypair.pem");
-                    let remote_pubkey = remote_data_dir.join("public_key.pem");
-                    remote.scp_upload(keypair, remote_keypair.to_str().unwrap())?;
-                    if let Some(pubkey) = &public_key_path {
-                        remote.scp_upload(pubkey, remote_pubkey.to_str().unwrap())?;
-                    }
-                }
-            }
+            // Upload keypair to remote
+            let remote_keypair = remote_data_dir.join("keypair.pem");
+            let remote_pubkey = remote_data_dir.join("public_key.pem");
+            remote.scp_upload(&keypair_path, remote_keypair.to_str().unwrap())?;
+            remote.scp_upload(&public_key_path, remote_pubkey.to_str().unwrap())?;
 
             // Upload gateway public keys for regular peers
             if !is_gateway {
@@ -393,22 +390,19 @@ impl NetworkBuilder {
 
         if is_gateway {
             args.push("--is-gateway".to_string());
-            if keypair_path.is_some() {
-                args.push("--transport-keypair".to_string());
-                let keypair_arg = match &location {
-                    PeerLocation::Local => {
-                        data_dir.join("keypair.pem").to_string_lossy().to_string()
-                    }
-                    PeerLocation::Remote(remote) => remote
-                        .remote_work_dir()
-                        .join(&id)
-                        .join("keypair.pem")
-                        .to_string_lossy()
-                        .to_string(),
-                };
-                args.push(keypair_arg);
-            }
         }
+
+        args.push("--transport-keypair".to_string());
+        let keypair_arg = match &location {
+            PeerLocation::Local => data_dir.join("keypair.pem").to_string_lossy().to_string(),
+            PeerLocation::Remote(remote) => remote
+                .remote_work_dir()
+                .join(&id)
+                .join("keypair.pem")
+                .to_string_lossy()
+                .to_string(),
+        };
+        args.push(keypair_arg);
 
         // Add gateway addresses for regular peers
         if !is_gateway && !gateway_info.is_empty() {
@@ -498,7 +492,7 @@ impl NetworkBuilder {
             network_address,
             data_dir,
             process,
-            public_key_path,
+            public_key_path: Some(public_key_path),
             location,
         })
     }

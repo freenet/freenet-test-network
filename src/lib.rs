@@ -15,6 +15,7 @@ pub use binary::{BuildProfile, FreenetBinary};
 pub use builder::NetworkBuilder;
 pub use logs::LogEntry;
 pub use network::{
+    ring_nodes_from_diagnostics, write_ring_visualization_from_diagnostics,
     NetworkDiagnosticsSnapshot, NetworkTopology, PeerDiagnosticsSnapshot, RingPeerSnapshot,
     RingVizMetrics, TestNetwork,
 };

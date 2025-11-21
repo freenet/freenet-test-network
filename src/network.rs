@@ -489,14 +489,14 @@ impl TestNetwork {
 }
 
 /// Snapshot describing diagnostics collected across the network at a moment in time.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkDiagnosticsSnapshot {
     pub collected_at: chrono::DateTime<Utc>,
     pub peers: Vec<PeerDiagnosticsSnapshot>,
 }
 
 /// Diagnostic information for a single peer.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerDiagnosticsSnapshot {
     pub peer_id: String,
     pub is_gateway: bool,
@@ -540,6 +540,65 @@ pub struct RingPeerSnapshot {
     pub connections: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract: Option<PeerContractStatus>,
+}
+
+/// Convert a diagnostics snapshot into the ring snapshot format used by the visualization.
+pub fn ring_nodes_from_diagnostics(snapshot: &NetworkDiagnosticsSnapshot) -> Vec<RingPeerSnapshot> {
+    snapshot
+        .peers
+        .iter()
+        .map(|peer| {
+            let location = peer
+                .location
+                .as_deref()
+                .and_then(|loc| loc.parse::<f64>().ok());
+            let (network_address, network_port) =
+                parse_listening_address(peer.listening_address.as_ref(), &peer.ws_url);
+            let ws_port = parse_ws_port(&peer.ws_url);
+            let mut connections = peer.connected_peer_ids.clone();
+            connections.retain(|id| id != &peer.peer_id);
+            connections.sort();
+            connections.dedup();
+
+            RingPeerSnapshot {
+                id: peer.peer_id.clone(),
+                is_gateway: peer.is_gateway,
+                ws_port,
+                network_port,
+                network_address,
+                location,
+                connections,
+                contract: None,
+            }
+        })
+        .collect()
+}
+
+/// Render a ring visualization from a saved diagnostics snapshot (e.g. a large soak run).
+pub fn write_ring_visualization_from_diagnostics<P: AsRef<Path>, Q: AsRef<Path>>(
+    snapshot: &NetworkDiagnosticsSnapshot,
+    run_root: P,
+    output_path: Q,
+) -> Result<()> {
+    let nodes = ring_nodes_from_diagnostics(snapshot);
+    let metrics = compute_ring_metrics(&nodes);
+    let payload = json!({
+        "generated_at": snapshot.collected_at.to_rfc3339(),
+        "run_root": run_root.as_ref().display().to_string(),
+        "nodes": nodes,
+        "metrics": metrics,
+    });
+    let data_json = serde_json::to_string(&payload).map_err(|e| Error::Other(e.into()))?;
+    let html = render_ring_template(&data_json);
+    let out_path = output_path.as_ref();
+    if let Some(parent) = out_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    fs::write(out_path, html)?;
+    tracing::info!(path = %out_path.display(), "Wrote ring visualization from diagnostics");
+    Ok(())
 }
 
 /// Contract-specific status for a peer when a contract key is provided.
@@ -836,9 +895,12 @@ fn compute_ring_metrics(nodes: &[RingPeerSnapshot]) -> RingVizMetrics {
     let pct_edges_under_10pct = calculate_percentage(&distances, 0.10);
 
     let mut distance_histogram = Vec::new();
-    let bucket_bounds = [0.02, 0.05, 0.1, 0.2, 0.3, 0.5];
+    let bucket_bounds: Vec<f64> = (1..=10).map(|i| i as f64 * 0.05).collect(); // 5% buckets up to 50%
+    let mut cumulative = 0usize;
     for bound in bucket_bounds {
-        let count = distances.iter().filter(|d| **d <= bound).count();
+        let up_to_bound = distances.iter().filter(|d| **d <= bound).count();
+        let count = up_to_bound.saturating_sub(cumulative);
+        cumulative = up_to_bound;
         distance_histogram.push(RingDistanceBucket {
             upper_bound: bound,
             count,
@@ -865,6 +927,34 @@ fn calculate_percentage(distances: &[f64], threshold: f64) -> Option<f64> {
     }
     let matching = distances.iter().filter(|value| **value < threshold).count();
     Some((matching as f64 / distances.len() as f64) * 100.0)
+}
+
+fn parse_ws_port(ws_url: &str) -> u16 {
+    ws_url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|host_port| host_port.split(':').nth(1))
+        .and_then(|port| port.parse().ok())
+        .unwrap_or(0)
+}
+
+fn parse_listening_address(addr: Option<&String>, ws_url: &str) -> (String, u16) {
+    if let Some(addr) = addr {
+        let mut parts = addr.split(':');
+        let host = parts.next().unwrap_or("").to_string();
+        let port = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        (host, port)
+    } else {
+        let host = ws_url
+            .split("://")
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .and_then(|host_port| host_port.split(':').next())
+            .unwrap_or_default()
+            .to_string();
+        (host, 0)
+    }
 }
 
 fn resolve_peer_id(prefix: &str, peers: &[RingPeerSnapshot]) -> Option<String> {
@@ -1059,7 +1149,20 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
       display: block;
       color: #94a3b8;
     }
+    .chart-card {
+      background: rgba(15, 23, 42, 0.75);
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+      margin-top: 12px;
+    }
+    .chart-card h3 {
+      margin: 0 0 8px;
+      font-size: 15px;
+      color: #e2e8f0;
+    }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
   <div id="container">
@@ -1067,6 +1170,10 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
     <p id="meta"></p>
     <canvas id="ring" width="900" height="900"></canvas>
     <div id="metrics"></div>
+    <div class="chart-card" style="height: 280px;">
+      <h3>Ring distance distribution</h3>
+      <canvas id="histogram-chart" style="height: 220px;"></canvas>
+    </div>
     <div class="legend">
       <span><span class="dot peer-dot"></span>Peer</span>
       <span><span class="dot gateway-dot"></span>Gateway</span>
@@ -1091,28 +1198,6 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
     const fmtNumber = (value, digits = 2) => (typeof value === "number" ? value.toFixed(digits) : "n/a");
     const fmtPercent = (value, digits = 1) => (typeof value === "number" ? `${value.toFixed(digits)}%` : "n/a");
 
-    const histogram = vizData.metrics.distance_histogram ?? [];
-    const maxBucketCount = histogram.reduce((acc, b) => Math.max(acc, b.count), 0);
-    const histoHtml = histogram.length
-      ? `<div style="grid-column: 1 / -1; margin-top: 8px;">
-            <strong>Ring distance histogram (cumulative)</strong>
-            <div style="display:flex; flex-direction:column; gap:4px; margin-top:6px;">
-              ${histogram
-                .map((b) => {
-                  const widthPct = maxBucketCount > 0 ? (b.count / maxBucketCount) * 100 : 0;
-                  return `<div style="display:flex; align-items:center; gap:8px;">
-                    <div style="width:180px; color:#94a3b8;">&le; ${(b.upper_bound * 100).toFixed(1)}% ring</div>
-                    <div style="flex:1; height:8px; background:rgba(148,163,184,0.2); border-radius:4px; position:relative;">
-                      <span style="display:block; height:8px; width:${widthPct}%; background:#38bdf8; border-radius:4px;"></span>
-                    </div>
-                    <span style="width:50px; text-align:right; color:#cbd5f5;">${b.count}</span>
-                  </div>`;
-                })
-                .join("")}
-            </div>
-         </div>`
-      : "";
-
     metricsEl.innerHTML = `
       <div><strong>Total nodes</strong><br/>${vizData.metrics.node_count} (gateways: ${vizData.metrics.gateway_count})</div>
       <div><strong>Edges</strong><br/>${vizData.metrics.edge_count}</div>
@@ -1120,8 +1205,61 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
       <div><strong>Average ring distance</strong><br/>${fmtNumber(vizData.metrics.average_ring_distance, 3)}</div>
       <div><strong>Min / Max ring distance</strong><br/>${fmtNumber(vizData.metrics.min_ring_distance, 3)} / ${fmtNumber(vizData.metrics.max_ring_distance, 3)}</div>
       <div><strong>Edges &lt;5% / &lt;10%</strong><br/>${fmtPercent(vizData.metrics.pct_edges_under_5pct)} / ${fmtPercent(vizData.metrics.pct_edges_under_10pct)}</div>
-      ${histoHtml}
     `;
+
+    const histogram = vizData.metrics.distance_histogram ?? [];
+    const labels = histogram.map((b, idx) => {
+      const lower = idx === 0 ? 0 : histogram[idx - 1].upper_bound;
+      return `${(lower * 100).toFixed(0)}–${(b.upper_bound * 100).toFixed(0)}%`;
+    });
+    const counts = histogram.map((b) => b.count);
+
+    if (histogram.length && window.Chart) {
+      const ctx = document.getElementById("histogram-chart").getContext("2d");
+      new Chart(ctx, {
+        data: {
+          labels,
+          datasets: [
+            {
+              type: "bar",
+              label: "Edges per bucket",
+              data: counts,
+              backgroundColor: "rgba(56, 189, 248, 0.75)",
+              borderColor: "#38bdf8",
+              borderWidth: 1,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: { position: "bottom" },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => {
+                  const label = ctx.dataset.label || "";
+                  const value = ctx.parsed.y;
+                  return ctx.dataset.type === "line"
+                    ? `${label}: ${value.toFixed(1)}%`
+                    : `${label}: ${value}`;
+                },
+              },
+            },
+          },
+          scales: {
+            x: { title: { display: true, text: "Ring distance (% of circumference)" } },
+            y: {
+              beginAtZero: true,
+              title: { display: true, text: "Edge count" },
+              grid: { color: "rgba(148,163,184,0.15)" },
+            },
+          },
+        },
+      });
+    }
 
     const peersEl = document.getElementById("peer-list");
     peersEl.innerHTML = vizData.nodes
