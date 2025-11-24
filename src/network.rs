@@ -657,6 +657,8 @@ pub struct RingVizMetrics {
     pub pct_edges_under_5pct: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pct_edges_under_10pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_over_long_ratio: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub distance_histogram: Vec<RingDistanceBucket>,
 }
@@ -894,8 +896,19 @@ fn compute_ring_metrics(nodes: &[RingPeerSnapshot]) -> RingVizMetrics {
     let pct_edges_under_5pct = calculate_percentage(&distances, 0.05);
     let pct_edges_under_10pct = calculate_percentage(&distances, 0.10);
 
+    let short_edges = distances.iter().filter(|d| **d <= 0.10).count();
+    let long_edges = distances
+        .iter()
+        .filter(|d| **d > 0.10 && **d <= 0.50)
+        .count();
+    let short_over_long_ratio = if short_edges == 0 || long_edges == 0 {
+        None
+    } else {
+        Some(short_edges as f64 / long_edges as f64)
+    };
+
     let mut distance_histogram = Vec::new();
-    let bucket_bounds: Vec<f64> = (1..=10).map(|i| i as f64 * 0.05).collect(); // 5% buckets up to 50%
+    let bucket_bounds: Vec<f64> = (1..=5).map(|i| i as f64 * 0.10).collect(); // 0.1 buckets up to 0.5
     let mut cumulative = 0usize;
     for bound in bucket_bounds {
         let up_to_bound = distances.iter().filter(|d| **d <= bound).count();
@@ -917,6 +930,7 @@ fn compute_ring_metrics(nodes: &[RingPeerSnapshot]) -> RingVizMetrics {
         max_ring_distance,
         pct_edges_under_5pct,
         pct_edges_under_10pct,
+        short_over_long_ratio,
         distance_histogram,
     }
 }
@@ -1205,12 +1219,13 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
       <div><strong>Average ring distance</strong><br/>${fmtNumber(vizData.metrics.average_ring_distance, 3)}</div>
       <div><strong>Min / Max ring distance</strong><br/>${fmtNumber(vizData.metrics.min_ring_distance, 3)} / ${fmtNumber(vizData.metrics.max_ring_distance, 3)}</div>
       <div><strong>Edges &lt;5% / &lt;10%</strong><br/>${fmtPercent(vizData.metrics.pct_edges_under_5pct)} / ${fmtPercent(vizData.metrics.pct_edges_under_10pct)}</div>
+      <div><strong>Short/long edge ratio (≤0.1 / 0.1–0.5)</strong><br/>${fmtNumber(vizData.metrics.short_over_long_ratio, 2)}</div>
     `;
 
     const histogram = vizData.metrics.distance_histogram ?? [];
     const labels = histogram.map((b, idx) => {
       const lower = idx === 0 ? 0 : histogram[idx - 1].upper_bound;
-      return `${(lower * 100).toFixed(0)}–${(b.upper_bound * 100).toFixed(0)}%`;
+      return `${lower.toFixed(1)}–${b.upper_bound.toFixed(1)}`;
     });
     const counts = histogram.map((b) => b.count);
 
@@ -1250,7 +1265,7 @@ const HTML_TEMPLATE: &str = r###"<!DOCTYPE html>
             },
           },
           scales: {
-            x: { title: { display: true, text: "Ring distance (% of circumference)" } },
+            x: { title: { display: true, text: "Ring distance (fraction of circumference)" } },
             y: {
               beginAtZero: true,
               title: { display: true, text: "Edge count" },
