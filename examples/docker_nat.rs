@@ -11,15 +11,21 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("info")
         .init();
 
+    // Allow configuring peer count via env var
+    let peer_count: usize = std::env::var("PEER_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+
     println!("Starting Docker NAT test network...");
     println!("This will create:");
     println!("  - 1 gateway on public network (172.20.0.10)");
-    println!("  - 2 peers, each behind their own NAT router");
+    println!("  - {} peers, each behind their own NAT router", peer_count);
     println!();
 
     let network = TestNetwork::builder()
         .gateways(1)
-        .peers(2)
+        .peers(peer_count)
         .binary(FreenetBinary::Installed) // Use system freenet binary
         .backend(Backend::DockerNat(DockerNatConfig::default()))
         .require_connectivity(1.0)

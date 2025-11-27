@@ -315,10 +315,16 @@ impl DockerNatBackend {
                 "sh".to_string(),
                 "-c".to_string(),
                 // Set up NAT (IP forwarding enabled via sysctl in host_config)
-                "apk add --no-cache iptables > /dev/null 2>&1 && \
-                 iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE && \
-                 iptables -A FORWARD -i eth1 -o eth0 -j ACCEPT && \
-                 iptables -A FORWARD -i eth0 -o eth1 -m state --state RELATED,ESTABLISHED -j ACCEPT && \
+                // Find interfaces dynamically by IP address since Docker doesn't guarantee interface order
+                // PUBLIC_IF: interface with 172.20.x.x (public network)
+                // PRIVATE_IF: interface with 10.x.x.x (private network)
+                "apk add --no-cache iptables iproute2 > /dev/null 2>&1 && \
+                 PUBLIC_IF=$(ip -o addr show | grep '172\\.20\\.' | awk '{print $2}') && \
+                 PRIVATE_IF=$(ip -o addr show | grep ' 10\\.' | awk '{print $2}') && \
+                 echo \"Public interface: $PUBLIC_IF, Private interface: $PRIVATE_IF\" && \
+                 iptables -t nat -A POSTROUTING -o $PUBLIC_IF -j MASQUERADE && \
+                 iptables -A FORWARD -i $PRIVATE_IF -o $PUBLIC_IF -j ACCEPT && \
+                 iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -m state --state RELATED,ESTABLISHED -j ACCEPT && \
                  echo 'NAT router ready' && \
                  tail -f /dev/null".to_string(),
             ]),
@@ -352,7 +358,7 @@ impl DockerNatBackend {
             },
         ).await;
 
-        // Connect router to public network first (eth0)
+        // Connect router to public network (becomes eth0 after starting)
         self.docker
             .connect_network(
                 public_network_id,
@@ -370,7 +376,7 @@ impl DockerNatBackend {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to connect router to public network: {}", e)))?;
 
-        // Connect router to private network (eth1)
+        // Connect router to private network (becomes eth1 after starting)
         self.docker
             .connect_network(
                 &network_id,
@@ -719,7 +725,8 @@ WORKDIR /app
 
         self.containers.push(container_id.clone());
 
-        // Connect to NAT network with specific IP
+        // Keep bridge network connected for Docker port forwarding to work (WebSocket access from host)
+        // Connect to NAT private network for Freenet traffic
         self.docker
             .connect_network(
                 &nat_network_id,
@@ -755,12 +762,13 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start peer: {}", e)))?;
 
-        // Configure routing through NAT router (.254 is our router's private IP)
+        // Configure routing: traffic to public network (172.20.0.0/24) goes through NAT router
+        // Keep default route via bridge for Docker port forwarding (WebSocket access from host)
         let router_gateway = Ipv4Addr::new(10, index as u8 + 1, 0, 254);
         self.exec_in_container(
             &container_id,
             &["sh", "-c", &format!(
-                "ip route del default 2>/dev/null; ip route add default via {}",
+                "ip route add 172.20.0.0/24 via {}",
                 router_gateway
             )],
         ).await?;

@@ -26,26 +26,38 @@ impl TestNetwork {
     }
 
     /// Read all logs in chronological order
+    ///
+    /// For Docker containers, this fetches logs from the Docker API and caches them.
+    /// For local processes, this reads directly from log files.
     pub fn read_logs(&self) -> Result<Vec<LogEntry>> {
         let mut entries = Vec::new();
 
-        for (peer_id, log_path) in self.log_files() {
-            if let Ok(file) = File::open(&log_path) {
-                let reader = BufReader::new(file);
-                for line in reader.lines().flatten() {
-                    let parsed = parse_log_line(&peer_id, &line);
-                    let is_new_entry = parsed.timestamp.is_some()
-                        || parsed.timestamp_raw.is_some()
-                        || entries.is_empty();
+        // Use process read_logs() to fetch from Docker API if needed
+        for peer in self.gateways.iter().chain(self.peers.iter()) {
+            match peer.read_logs() {
+                Ok(peer_entries) => entries.extend(peer_entries),
+                Err(e) => {
+                    tracing::warn!("Failed to read logs from {}: {}", peer.id(), e);
+                    // Fallback to reading from file if process read fails
+                    let log_path = peer.log_path();
+                    if let Ok(file) = File::open(&log_path) {
+                        let reader = BufReader::new(file);
+                        for line in reader.lines().flatten() {
+                            let parsed = parse_log_line(peer.id(), &line);
+                            let is_new_entry = parsed.timestamp.is_some()
+                                || parsed.timestamp_raw.is_some()
+                                || entries.is_empty();
 
-                    if is_new_entry {
-                        entries.push(parsed);
-                    } else if let Some(last) = entries.last_mut() {
-                        if !parsed.message.is_empty() {
-                            if !last.message.is_empty() {
-                                last.message.push('\n');
+                            if is_new_entry {
+                                entries.push(parsed);
+                            } else if let Some(last) = entries.last_mut() {
+                                if !parsed.message.is_empty() {
+                                    if !last.message.is_empty() {
+                                        last.message.push('\n');
+                                    }
+                                    last.message.push_str(&parsed.message);
+                                }
                             }
-                            last.message.push_str(&parsed.message);
                         }
                     }
                 }

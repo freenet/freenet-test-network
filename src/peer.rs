@@ -45,6 +45,11 @@ impl TestPeer {
         self.process.log_path()
     }
 
+    /// Read logs from this peer (fetches from Docker if needed)
+    pub fn read_logs(&self) -> Result<Vec<crate::logs::LogEntry>> {
+        self.process.read_logs()
+    }
+
     /// Check if the peer process is still running
     pub fn is_running(&self) -> bool {
         self.process.is_running()

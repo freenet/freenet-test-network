@@ -18,6 +18,23 @@ use std::{
     time::Duration,
 };
 
+/// Detailed connectivity status for a single peer
+#[derive(Debug, Clone)]
+pub struct PeerConnectivityStatus {
+    pub peer_id: String,
+    pub connections: Option<usize>,
+    pub error: Option<String>,
+}
+
+/// Detailed connectivity check result
+#[derive(Debug)]
+pub struct ConnectivityStatus {
+    pub total_peers: usize,
+    pub connected_peers: usize,
+    pub ratio: f64,
+    pub peer_status: Vec<PeerConnectivityStatus>,
+}
+
 /// A test network consisting of gateways and peer nodes
 pub struct TestNetwork {
     pub(crate) gateways: Vec<TestPeer>,
@@ -66,6 +83,8 @@ impl TestNetwork {
     /// Wait until the network is ready with a custom timeout
     pub async fn wait_until_ready_with_timeout(&self, timeout: Duration) -> Result<()> {
         let start = std::time::Instant::now();
+        let mut last_progress_log = std::time::Instant::now();
+        let progress_interval = Duration::from_secs(10);
 
         tracing::info!(
             "Waiting for network connectivity (timeout: {}s, required: {}%)",
@@ -75,6 +94,16 @@ impl TestNetwork {
 
         loop {
             if start.elapsed() > timeout {
+                // Log final detailed status on failure
+                let status = self.check_connectivity_detailed().await;
+                let details = Self::format_connectivity_status(&status);
+                tracing::error!(
+                    "Connectivity timeout: {}/{} peers connected ({:.1}%) - {}",
+                    status.connected_peers,
+                    status.total_peers,
+                    status.ratio * 100.0,
+                    details
+                );
                 return Err(Error::ConnectivityFailed(format!(
                     "Network did not reach {}% connectivity within {}s",
                     (self.min_connectivity * 100.0) as u8,
@@ -82,52 +111,114 @@ impl TestNetwork {
                 )));
             }
 
-            // Check connectivity by querying peers for their connections
-            match self.check_connectivity().await {
-                Ok(ratio) if ratio >= self.min_connectivity => {
-                    tracing::info!("Network ready: {:.1}% connectivity", ratio * 100.0);
-                    return Ok(());
-                }
-                Ok(ratio) => {
-                    tracing::debug!("Network connectivity: {:.1}%", ratio * 100.0);
-                }
-                Err(e) => {
-                    tracing::debug!("Connectivity check failed: {}", e);
-                }
+            // Check connectivity with detailed status
+            let status = self.check_connectivity_detailed().await;
+
+            if status.ratio >= self.min_connectivity {
+                tracing::info!("Network ready: {:.1}% connectivity", status.ratio * 100.0);
+                return Ok(());
+            }
+
+            // Log progress periodically (every 10 seconds)
+            if last_progress_log.elapsed() >= progress_interval {
+                let elapsed = start.elapsed().as_secs();
+                let details = Self::format_connectivity_status(&status);
+                tracing::info!(
+                    "[{}s] Connectivity: {}/{} ({:.0}%) - {}",
+                    elapsed,
+                    status.connected_peers,
+                    status.total_peers,
+                    status.ratio * 100.0,
+                    details
+                );
+                last_progress_log = std::time::Instant::now();
+            } else {
+                tracing::debug!(
+                    "Network connectivity: {}/{} ({:.1}%)",
+                    status.connected_peers,
+                    status.total_peers,
+                    status.ratio * 100.0
+                );
             }
 
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    /// Check current network connectivity ratio (0.0 to 1.0)
-    async fn check_connectivity(&self) -> Result<f64> {
+    /// Check current network connectivity with detailed status
+    pub async fn check_connectivity_detailed(&self) -> ConnectivityStatus {
         let all_peers: Vec<_> = self.gateways.iter().chain(self.peers.iter()).collect();
         let total = all_peers.len();
 
         if total == 0 {
-            return Ok(1.0);
+            return ConnectivityStatus {
+                total_peers: 0,
+                connected_peers: 0,
+                ratio: 1.0,
+                peer_status: vec![],
+            };
         }
 
         let mut connected_count = 0;
+        let mut peer_status = Vec::with_capacity(total);
 
         for peer in &all_peers {
             match self.query_peer_connections(peer).await {
                 Ok(0) => {
-                    tracing::trace!("{} has no connections (isolated)", peer.id());
+                    peer_status.push(PeerConnectivityStatus {
+                        peer_id: peer.id().to_string(),
+                        connections: Some(0),
+                        error: None,
+                    });
                 }
                 Ok(connections) => {
                     connected_count += 1;
-                    tracing::trace!("{} has {} connections", peer.id(), connections);
+                    peer_status.push(PeerConnectivityStatus {
+                        peer_id: peer.id().to_string(),
+                        connections: Some(connections),
+                        error: None,
+                    });
                 }
                 Err(e) => {
-                    tracing::debug!("Failed to query {}: {}", peer.id(), e);
+                    peer_status.push(PeerConnectivityStatus {
+                        peer_id: peer.id().to_string(),
+                        connections: None,
+                        error: Some(e.to_string()),
+                    });
                 }
             }
         }
 
         let ratio = connected_count as f64 / total as f64;
-        Ok(ratio)
+        ConnectivityStatus {
+            total_peers: total,
+            connected_peers: connected_count,
+            ratio,
+            peer_status,
+        }
+    }
+
+    /// Check current network connectivity ratio (0.0 to 1.0)
+    async fn check_connectivity(&self) -> Result<f64> {
+        let status = self.check_connectivity_detailed().await;
+        Ok(status.ratio)
+    }
+
+    /// Format connectivity status for logging
+    fn format_connectivity_status(status: &ConnectivityStatus) -> String {
+        let mut parts: Vec<String> = status
+            .peer_status
+            .iter()
+            .map(|p| {
+                match (&p.connections, &p.error) {
+                    (Some(c), _) => format!("{}:{}", p.peer_id, c),
+                    (None, Some(_)) => format!("{}:err", p.peer_id),
+                    (None, None) => format!("{}:?", p.peer_id),
+                }
+            })
+            .collect();
+        parts.sort();
+        parts.join(", ")
     }
 
     /// Query a single peer for its connection count
