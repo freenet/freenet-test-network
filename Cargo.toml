@@ -23,6 +23,10 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 freenet-stdlib = { version = "0.1.23", features = ["net"] }
 regex = "1"
 ssh2 = "0.9"
+bollard = "0.18"
+ipnetwork = "0.20"
+rand = "0.8"
+tar = "0.4"
 
 [dev-dependencies]
 testresult = "0.4"

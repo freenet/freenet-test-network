@@ -5,6 +5,7 @@
 
 mod binary;
 mod builder;
+pub mod docker;
 mod logs;
 mod network;
 mod peer;
@@ -12,7 +13,8 @@ mod process;
 mod remote;
 
 pub use binary::{BuildProfile, FreenetBinary};
-pub use builder::NetworkBuilder;
+pub use builder::{Backend, NetworkBuilder};
+pub use docker::{DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology, NatType};
 pub use logs::LogEntry;
 pub use network::{
     ring_nodes_from_diagnostics, write_ring_visualization_from_diagnostics,

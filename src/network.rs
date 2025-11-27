@@ -1,4 +1,4 @@
-use crate::{peer::TestPeer, Error, Result};
+use crate::{docker::DockerNatBackend, peer::TestPeer, Error, Result};
 use chrono::Utc;
 use freenet_stdlib::{
     client_api::{
@@ -24,6 +24,8 @@ pub struct TestNetwork {
     pub(crate) peers: Vec<TestPeer>,
     pub(crate) min_connectivity: f64,
     pub(crate) run_root: PathBuf,
+    /// Docker backend for NAT simulation (if used)
+    pub(crate) docker_backend: Option<DockerNatBackend>,
 }
 
 impl TestNetwork {
@@ -479,6 +481,23 @@ impl TestNetwork {
             peers,
             min_connectivity,
             run_root,
+            docker_backend: None,
+        }
+    }
+
+    pub(crate) fn new_with_docker(
+        gateways: Vec<TestPeer>,
+        peers: Vec<TestPeer>,
+        min_connectivity: f64,
+        run_root: PathBuf,
+        docker_backend: Option<DockerNatBackend>,
+    ) -> Self {
+        Self {
+            gateways,
+            peers,
+            min_connectivity,
+            run_root,
+            docker_backend,
         }
     }
 

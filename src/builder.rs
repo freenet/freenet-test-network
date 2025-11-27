@@ -1,5 +1,6 @@
 use crate::{
     binary::FreenetBinary,
+    docker::{DockerNatBackend, DockerNatConfig},
     network::TestNetwork,
     peer::{get_free_port, TestPeer},
     process::{self, PeerProcess},
@@ -13,6 +14,26 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+/// Backend for running the test network
+#[derive(Debug, Clone)]
+pub enum Backend {
+    /// Local processes on the host (default)
+    Local,
+    /// Docker containers behind simulated NAT
+    DockerNat(DockerNatConfig),
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        // Check environment variable for default
+        if std::env::var("FREENET_TEST_DOCKER_NAT").is_ok() {
+            Backend::DockerNat(DockerNatConfig::default())
+        } else {
+            Backend::Local
+        }
+    }
+}
 
 struct GatewayInfo {
     address: String,
@@ -33,6 +54,7 @@ pub struct NetworkBuilder {
     min_connections: Option<usize>,
     max_connections: Option<usize>,
     start_stagger: Duration,
+    backend: Backend,
 }
 
 impl Default for NetworkBuilder {
@@ -56,6 +78,7 @@ impl NetworkBuilder {
             min_connections: None,
             max_connections: None,
             start_stagger: Duration::from_millis(500),
+            backend: Backend::default(),
         }
     }
 
@@ -143,8 +166,22 @@ impl NetworkBuilder {
         self
     }
 
+    /// Set the backend for running peers (Local or DockerNat)
+    pub fn backend(mut self, backend: Backend) -> Self {
+        self.backend = backend;
+        self
+    }
+
     /// Build and start the network (async)
     pub async fn build(self) -> Result<TestNetwork> {
+        match self.backend.clone() {
+            Backend::Local => self.build_local().await,
+            Backend::DockerNat(config) => self.build_docker_nat(config).await,
+        }
+    }
+
+    /// Build network using local processes (original implementation)
+    async fn build_local(self) -> Result<TestNetwork> {
         let binary_path = self.binary.resolve()?;
 
         tracing::info!(
@@ -336,6 +373,10 @@ impl NetworkBuilder {
         if let PeerLocation::Remote(remote) = &location {
             let remote_data_dir = remote.remote_work_dir().join(&id);
 
+            // Create remote data directory before uploading files
+            let mkdir_cmd = format!("mkdir -p {}", remote_data_dir.display());
+            remote.exec(&mkdir_cmd)?;
+
             // Upload keypair to remote
             let remote_keypair = remote_data_dir.join("keypair.pem");
             let remote_pubkey = remote_data_dir.join("public_key.pem");
@@ -495,6 +536,192 @@ impl NetworkBuilder {
             public_key_path: Some(public_key_path),
             location,
         })
+    }
+
+    /// Build network using Docker containers with NAT simulation
+    async fn build_docker_nat(self, config: DockerNatConfig) -> Result<TestNetwork> {
+        let binary_path = self.binary.resolve()?;
+
+        tracing::info!(
+            "Starting Docker NAT test network: {} gateways, {} peers",
+            self.gateways,
+            self.peers
+        );
+
+        let base_dir = resolve_base_dir();
+        fs::create_dir_all(&base_dir)?;
+        cleanup_old_runs(&base_dir, 5)?;
+        let run_root = create_run_directory(&base_dir)?;
+
+        let mut run_status = RunStatusGuard::new(&run_root);
+
+        // Initialize Docker backend
+        let mut docker_backend = DockerNatBackend::new(config).await.map_err(|e| {
+            run_status.mark("failure", Some(&format!("Docker init failed: {}", e)));
+            e
+        })?;
+
+        // Create public network
+        docker_backend.create_public_network().await.map_err(|e| {
+            run_status.mark("failure", Some(&format!("Failed to create public network: {}", e)));
+            e
+        })?;
+
+        // Standard ports inside containers
+        let ws_port: u16 = 9000;
+        let network_port: u16 = 31337;
+
+        // Start gateways first
+        let mut gateways = Vec::new();
+        for i in 0..self.gateways {
+            let data_dir = create_peer_dir(&run_root, &format!("gw{}", i))?;
+
+            // Generate keypair locally
+            let keypair_path = data_dir.join("keypair.pem");
+            let public_key_path = data_dir.join("public_key.pem");
+            generate_keypair(&keypair_path, &public_key_path)?;
+
+            let (info, process) = docker_backend
+                .create_gateway(
+                    i,
+                    &binary_path,
+                    &keypair_path,
+                    &public_key_path,
+                    ws_port,
+                    network_port,
+                    &run_root,
+                )
+                .await
+                .map_err(|e| {
+                    let detail = format!("failed to start gateway {}: {}", i, e);
+                    run_status.mark("failure", Some(&detail));
+                    e
+                })?;
+
+            let peer = TestPeer {
+                id: format!("gw{}", i),
+                is_gateway: true,
+                ws_port: info.host_ws_port,
+                network_port: info.network_port,
+                network_address: info.public_ip.to_string(),
+                data_dir,
+                process: Box::new(process),
+                public_key_path: Some(public_key_path),
+                location: PeerLocation::Local, // Treated as local from API perspective
+            };
+            gateways.push(peer);
+        }
+
+        // Collect gateway info for peers
+        let gateway_info: Vec<_> = gateways
+            .iter()
+            .map(|gw| GatewayInfo {
+                address: format!("{}:{}", gw.network_address, network_port),
+                public_key_path: gw
+                    .public_key_path
+                    .clone()
+                    .expect("Gateway must have public key"),
+            })
+            .collect();
+
+        // Start regular peers (each behind its own NAT)
+        let mut peers = Vec::new();
+        for i in 0..self.peers {
+            let peer_index = i + self.gateways;
+            let data_dir = create_peer_dir(&run_root, &format!("peer{}", peer_index))?;
+
+            // Generate keypair locally
+            let keypair_path = data_dir.join("keypair.pem");
+            let public_key_path = data_dir.join("public_key.pem");
+            generate_keypair(&keypair_path, &public_key_path)?;
+
+            // Create gateways.toml pointing to gateway's public network address
+            let gateways_toml_path = data_dir.join("gateways.toml");
+            let mut gateways_content = String::new();
+            for gw in &gateway_info {
+                gateways_content.push_str(&format!(
+                    "[[gateways]]\n\
+                     address = {{ hostname = \"{}\" }}\n\
+                     public_key = \"/config/gw_public_key.pem\"\n\n",
+                    gw.address,
+                ));
+            }
+            std::fs::write(&gateways_toml_path, &gateways_content)?;
+
+            // Get gateway public key path if available
+            let gateway_public_key_path = gateway_info.first().map(|gw| gw.public_key_path.clone());
+
+            let (info, process) = docker_backend
+                .create_peer(
+                    peer_index,
+                    &binary_path,
+                    &keypair_path,
+                    &public_key_path,
+                    &gateways_toml_path,
+                    gateway_public_key_path.as_deref(),
+                    ws_port,
+                    network_port,
+                    &run_root,
+                )
+                .await
+                .map_err(|e| {
+                    let detail = format!("failed to start peer {}: {}", peer_index, e);
+                    run_status.mark("failure", Some(&detail));
+                    e
+                })?;
+
+            let peer = TestPeer {
+                id: format!("peer{}", peer_index),
+                is_gateway: false,
+                ws_port: info.host_ws_port,
+                network_port: info.network_port,
+                network_address: info.private_ip.to_string(),
+                data_dir,
+                process: Box::new(process),
+                public_key_path: Some(public_key_path),
+                location: PeerLocation::Local,
+            };
+            peers.push(peer);
+
+            if i + 1 < self.peers && !self.start_stagger.is_zero() {
+                tokio::time::sleep(self.start_stagger).await;
+            }
+        }
+
+        // Store Docker backend in network for cleanup
+        let network = TestNetwork::new_with_docker(
+            gateways,
+            peers,
+            self.min_connectivity,
+            run_root.clone(),
+            Some(docker_backend),
+        );
+
+        // Wait for network to be ready
+        match network
+            .wait_until_ready_with_timeout(self.connectivity_timeout)
+            .await
+        {
+            Ok(()) => {
+                if self.preserve_data_on_success {
+                    println!("Network data directories preserved at {}", run_root.display());
+                }
+                let detail = format!("success: gateways={}, peers={} (Docker NAT)", self.gateways, self.peers);
+                run_status.mark("success", Some(&detail));
+                Ok(network)
+            }
+            Err(err) => {
+                if let Err(log_err) = dump_recent_logs(&network) {
+                    eprintln!("Failed to dump logs after connectivity error: {}", log_err);
+                }
+                if self.preserve_data_on_failure {
+                    eprintln!("Network data directories preserved at {}", run_root.display());
+                }
+                let detail = err.to_string();
+                run_status.mark("failure", Some(&detail));
+                Err(err)
+            }
+        }
     }
 }
 
