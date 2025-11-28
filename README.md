@@ -59,6 +59,77 @@ let network = TestNetwork::builder()
 
 If startup fails, the preserved artifacts are placed under `/tmp/freenet-test-network-<timestamp>/`.
 
+## Docker NAT Simulation
+
+**New**: Test Freenet peers behind simulated NAT routers using Docker containers.
+
+### Why Docker NAT Testing?
+
+Testing on localhost can't catch bugs related to:
+- NAT traversal and port mapping
+- Peers on different private networks
+- Real network isolation
+- Gateway discovery from behind NAT
+
+### Quick Start
+
+```rust
+use freenet_test_network::{TestNetwork, Backend, DockerNatConfig};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let network = TestNetwork::builder()
+        .gateways(1)                                    // Gateway on public network
+        .peers(2)                                        // Peers behind NAT
+        .backend(Backend::DockerNat(DockerNatConfig::default()))
+        .build()
+        .await?;
+
+    // Each peer runs in its own container behind a NAT router
+    println!("Gateway: {}", network.gateway(0).ws_url());
+    println!("Peer 0 (NAT): {}", network.peer(0).ws_url());
+
+    Ok(())
+}
+```
+
+### Automatic Cleanup
+
+The Docker NAT backend automatically cleans up resources:
+
+1. **On normal exit**: Containers and networks are removed via Drop trait
+2. **On ctrl-c**: Signal handler ensures graceful cleanup
+3. **On panic**: Drop trait still executes, cleaning up resources
+4. **Stale resources**: Automatically removed at startup (older than 5 minutes)
+
+Resource names include timestamps (e.g., `freenet-nat-20251126-211500-13135`) for easy identification.
+
+### Manual Cleanup
+
+If resources are somehow left behind, you can manually clean them:
+
+```bash
+# List freenet-nat resources
+docker ps -a | grep freenet-nat
+docker network ls | grep freenet-nat
+
+# Remove all freenet-nat containers
+docker ps -a | grep freenet-nat | awk '{print $1}' | xargs -r docker rm -f
+
+# Remove all freenet-nat networks
+docker network ls | grep freenet-nat | awk '{print $1}' | xargs -r docker network rm
+```
+
+### Example
+
+See `examples/docker_nat.rs` for a complete example:
+
+```bash
+cargo run --example docker_nat
+# Or with custom peer count:
+PEER_COUNT=4 cargo run --example docker_nat
+```
+
 ## Remote Peer Support (SSH)
 
 **New in v0.2**: Spawn peers on remote Linux machines via SSH for realistic NAT/firewall testing.

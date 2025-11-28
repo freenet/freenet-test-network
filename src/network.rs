@@ -209,12 +209,10 @@ impl TestNetwork {
         let mut parts: Vec<String> = status
             .peer_status
             .iter()
-            .map(|p| {
-                match (&p.connections, &p.error) {
-                    (Some(c), _) => format!("{}:{}", p.peer_id, c),
-                    (None, Some(_)) => format!("{}:err", p.peer_id),
-                    (None, None) => format!("{}:?", p.peer_id),
-                }
+            .map(|p| match (&p.connections, &p.error) {
+                (Some(c), _) => format!("{}:{}", p.peer_id, c),
+                (None, Some(_)) => format!("{}:err", p.peer_id),
+                (None, None) => format!("{}:?", p.peer_id),
             })
             .collect();
         parts.sort();

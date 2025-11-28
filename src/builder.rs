@@ -563,7 +563,10 @@ impl NetworkBuilder {
 
         // Create public network
         docker_backend.create_public_network().await.map_err(|e| {
-            run_status.mark("failure", Some(&format!("Failed to create public network: {}", e)));
+            run_status.mark(
+                "failure",
+                Some(&format!("Failed to create public network: {}", e)),
+            );
             e
         })?;
 
@@ -704,9 +707,15 @@ impl NetworkBuilder {
         {
             Ok(()) => {
                 if self.preserve_data_on_success {
-                    println!("Network data directories preserved at {}", run_root.display());
+                    println!(
+                        "Network data directories preserved at {}",
+                        run_root.display()
+                    );
                 }
-                let detail = format!("success: gateways={}, peers={} (Docker NAT)", self.gateways, self.peers);
+                let detail = format!(
+                    "success: gateways={}, peers={} (Docker NAT)",
+                    self.gateways, self.peers
+                );
                 run_status.mark("success", Some(&detail));
                 Ok(network)
             }
@@ -715,7 +724,10 @@ impl NetworkBuilder {
                     eprintln!("Failed to dump logs after connectivity error: {}", log_err);
                 }
                 if self.preserve_data_on_failure {
-                    eprintln!("Network data directories preserved at {}", run_root.display());
+                    eprintln!(
+                        "Network data directories preserved at {}",
+                        run_root.display()
+                    );
                 }
                 let detail = err.to_string();
                 run_status.mark("failure", Some(&detail));

@@ -7,8 +7,8 @@
 use crate::{logs::LogEntry, process::PeerProcess, Error, Result};
 use bollard::{
     container::{
-        Config, CreateContainerOptions, LogOutput, LogsOptions,
-        RemoveContainerOptions, StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
+        Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
+        StartContainerOptions, StopContainerOptions, UploadToContainerOptions,
     },
     exec::{CreateExecOptions, StartExecResults},
     image::BuildImageOptions,
@@ -43,12 +43,28 @@ pub struct DockerNatConfig {
 
 impl Default for DockerNatConfig {
     fn default() -> Self {
+        // Generate timestamp-based prefix for easier identification of stale resources
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let random_id = rand::thread_rng().gen::<u16>();
+        let name_prefix = format!("freenet-nat-{}-{}", timestamp, random_id);
+
+        // Randomize the second octet (16-31) to avoid subnet overlap when running
+        // multiple tests sequentially. Docker cannot create networks with overlapping
+        // subnets, so each test run needs a unique subnet range.
+        // Using 172.16.0.0/12 private range: 172.16-31.x.x
+        let second_octet = rand::thread_rng().gen_range(16..=31);
+        let public_subnet = format!("172.{}.0.0/24", second_octet).parse().unwrap();
+
+        // Also randomize the private subnet base to avoid conflicts
+        // Using 10.x.0.0 range with random first octet portion
+        let private_first_octet = rand::thread_rng().gen_range(1..=250);
+
         Self {
             topology: NatTopology::OnePerNat,
-            public_subnet: "172.20.0.0/24".parse().unwrap(),
-            private_subnet_base: Ipv4Addr::new(10, 0, 0, 0),
+            public_subnet,
+            private_subnet_base: Ipv4Addr::new(10, private_first_octet, 0, 0),
             cleanup_on_drop: true,
-            name_prefix: format!("freenet-nat-{}", rand::thread_rng().gen::<u16>()),
+            name_prefix,
         }
     }
 }
@@ -130,12 +146,11 @@ impl PeerProcess for DockerProcess {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 match docker.inspect_container(&id, None).await {
-                    Ok(info) => {
-                        info.state
-                            .and_then(|s| s.status)
-                            .map(|s| s == ContainerStateStatusEnum::RUNNING)
-                            .unwrap_or(false)
-                    }
+                    Ok(info) => info
+                        .state
+                        .and_then(|s| s.status)
+                        .map(|s| s == ContainerStateStatusEnum::RUNNING)
+                        .unwrap_or(false),
                     Err(_) => false,
                 }
             })
@@ -219,6 +234,9 @@ impl DockerNatBackend {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Docker ping failed: {}", e)))?;
 
+        // Clean up stale resources before creating new ones
+        Self::cleanup_stale_resources(&docker, Duration::from_secs(300)).await?;
+
         Ok(Self {
             docker,
             config,
@@ -227,6 +245,132 @@ impl DockerNatBackend {
             peer_containers: HashMap::new(),
             public_network_id: None,
         })
+    }
+
+    /// Clean up stale Docker resources older than the specified duration
+    ///
+    /// This removes containers and networks matching the "freenet-nat-" prefix
+    /// that are older than `max_age`.
+    async fn cleanup_stale_resources(docker: &Docker, max_age: Duration) -> Result<()> {
+        use bollard::container::ListContainersOptions;
+        use bollard::network::ListNetworksOptions;
+
+        let now = std::time::SystemTime::now();
+        let cutoff = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+            - max_age.as_secs() as i64;
+
+        tracing::debug!(
+            "Cleaning up freenet-nat resources older than {} seconds",
+            max_age.as_secs()
+        );
+
+        // Clean up stale containers
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec!["freenet-nat-".to_string()]);
+
+        let options = ListContainersOptions {
+            all: true,
+            filters,
+            ..Default::default()
+        };
+
+        match docker.list_containers(Some(options)).await {
+            Ok(containers) => {
+                let mut removed_count = 0;
+                for container in containers {
+                    // Parse timestamp from container name
+                    if let Some(name) = container.names.and_then(|n| n.first().cloned()) {
+                        if let Some(created) = container.created {
+                            if created < cutoff {
+                                if let Some(id) = container.id {
+                                    tracing::info!(
+                                        "Removing stale container: {} (age: {}s)",
+                                        name,
+                                        now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+                                            as i64
+                                            - created
+                                    );
+                                    let _ = docker
+                                        .stop_container(&id, Some(StopContainerOptions { t: 2 }))
+                                        .await;
+                                    let _ = docker
+                                        .remove_container(
+                                            &id,
+                                            Some(RemoveContainerOptions {
+                                                force: true,
+                                                ..Default::default()
+                                            }),
+                                        )
+                                        .await;
+                                    removed_count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                if removed_count > 0 {
+                    tracing::info!("Removed {} stale container(s)", removed_count);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to list containers for cleanup: {}", e);
+            }
+        }
+
+        // Clean up stale networks
+        let mut filters = HashMap::new();
+        filters.insert("name".to_string(), vec!["freenet-nat-".to_string()]);
+
+        let options = ListNetworksOptions { filters };
+
+        match docker.list_networks(Some(options)).await {
+            Ok(networks) => {
+                let mut removed_count = 0;
+                for network in networks {
+                    if let Some(name) = &network.name {
+                        if name.starts_with("freenet-nat-") {
+                            // Parse timestamp from network name (format: freenet-nat-YYYYMMDD-HHMMSS-xxxxx)
+                            if let Some(timestamp_str) = name.strip_prefix("freenet-nat-") {
+                                // Extract YYYYMMDD-HHMMSS part
+                                let parts: Vec<&str> = timestamp_str.split('-').collect();
+                                if parts.len() >= 2 {
+                                    let date_time = format!("{}-{}", parts[0], parts[1]);
+                                    if let Ok(created_time) = chrono::NaiveDateTime::parse_from_str(
+                                        &date_time,
+                                        "%Y%m%d-%H%M%S",
+                                    ) {
+                                        let created_timestamp = created_time.and_utc().timestamp();
+                                        if created_timestamp < cutoff {
+                                            if let Some(id) = &network.id {
+                                                tracing::info!(
+                                                    "Removing stale network: {} (age: {}s)",
+                                                    name,
+                                                    now.duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap()
+                                                        .as_secs()
+                                                        as i64
+                                                        - created_timestamp
+                                                );
+                                                let _ = docker.remove_network(id).await;
+                                                removed_count += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if removed_count > 0 {
+                    tracing::info!("Removed {} stale network(s)", removed_count);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to list networks for cleanup: {}", e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Create the public network where gateways live
@@ -246,10 +390,10 @@ impl DockerNatBackend {
             ..Default::default()
         };
 
-        let response = self.docker
-            .create_network(options)
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to create public network: {}", e)))?;
+        let response =
+            self.docker.create_network(options).await.map_err(|e| {
+                Error::Other(anyhow::anyhow!("Failed to create public network: {}", e))
+            })?;
 
         let network_id = response.id;
 
@@ -261,13 +405,19 @@ impl DockerNatBackend {
     }
 
     /// Create a private network behind NAT for a peer
-    pub async fn create_nat_network(&mut self, peer_index: usize) -> Result<(String, String, Ipv4Addr)> {
-        // Create private network
+    pub async fn create_nat_network(
+        &mut self,
+        peer_index: usize,
+    ) -> Result<(String, String, Ipv4Addr)> {
+        // Create private network using randomized base to avoid subnet conflicts
+        // between concurrent test runs. Each peer gets its own /24 subnet.
         let network_name = format!("{}-nat-{}", self.config.name_prefix, peer_index);
+        let base = self.config.private_subnet_base.octets();
         let subnet = Ipv4Network::new(
-            Ipv4Addr::new(10, peer_index as u8 + 1, 0, 0),
+            Ipv4Addr::new(base[0], base[1].wrapping_add(peer_index as u8), 0, 0),
             24,
-        ).map_err(|e| Error::Other(anyhow::anyhow!("Invalid subnet: {}", e)))?;
+        )
+        .map_err(|e| Error::Other(anyhow::anyhow!("Invalid subnet: {}", e)))?;
 
         let options = CreateNetworkOptions {
             name: network_name.clone(),
@@ -283,17 +433,19 @@ impl DockerNatBackend {
             ..Default::default()
         };
 
-        let response = self.docker
-            .create_network(options)
-            .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to create NAT network: {}", e)))?;
+        let response =
+            self.docker.create_network(options).await.map_err(|e| {
+                Error::Other(anyhow::anyhow!("Failed to create NAT network: {}", e))
+            })?;
 
         let network_id = response.id;
         self.networks.push(network_id.clone());
 
         // Create NAT router container
         let router_name = format!("{}-router-{}", self.config.name_prefix, peer_index);
-        let public_network_id = self.public_network_id.as_ref()
+        let public_network_id = self
+            .public_network_id
+            .as_ref()
             .ok_or_else(|| Error::Other(anyhow::anyhow!("Public network not created yet")))?;
 
         // NAT router IP addresses
@@ -304,10 +456,15 @@ impl DockerNatBackend {
             100 + peer_index as u8,
         );
         // Use .254 for router to avoid conflict with Docker's default gateway at .1
-        let router_private_ip = Ipv4Addr::new(10, peer_index as u8 + 1, 0, 254);
+        let router_private_ip =
+            Ipv4Addr::new(base[0], base[1].wrapping_add(peer_index as u8), 0, 254);
 
         // Create router container with iptables NAT rules
         // Create without network first, then connect to both networks before starting
+        // Build patterns for matching the public and private networks
+        let public_octets = self.config.public_subnet.ip().octets();
+        let public_pattern = format!("172\\.{}\\.", public_octets[1]);
+        let private_pattern = format!(" {}\\.", base[0]);
         let router_config = Config {
             image: Some("alpine:latest".to_string()),
             hostname: Some(router_name.clone()),
@@ -316,17 +473,20 @@ impl DockerNatBackend {
                 "-c".to_string(),
                 // Set up NAT (IP forwarding enabled via sysctl in host_config)
                 // Find interfaces dynamically by IP address since Docker doesn't guarantee interface order
-                // PUBLIC_IF: interface with 172.20.x.x (public network)
+                // PUBLIC_IF: interface with 172.X.x.x (public network, X varies)
                 // PRIVATE_IF: interface with 10.x.x.x (private network)
-                "apk add --no-cache iptables iproute2 > /dev/null 2>&1 && \
-                 PUBLIC_IF=$(ip -o addr show | grep '172\\.20\\.' | awk '{print $2}') && \
-                 PRIVATE_IF=$(ip -o addr show | grep ' 10\\.' | awk '{print $2}') && \
-                 echo \"Public interface: $PUBLIC_IF, Private interface: $PRIVATE_IF\" && \
-                 iptables -t nat -A POSTROUTING -o $PUBLIC_IF -j MASQUERADE && \
-                 iptables -A FORWARD -i $PRIVATE_IF -o $PUBLIC_IF -j ACCEPT && \
-                 iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -m state --state RELATED,ESTABLISHED -j ACCEPT && \
-                 echo 'NAT router ready' && \
-                 tail -f /dev/null".to_string(),
+                format!(
+                    "apk add --no-cache iptables iproute2 > /dev/null 2>&1 && \
+                     PUBLIC_IF=$(ip -o addr show | grep '{}' | awk '{{print $2}}') && \
+                     PRIVATE_IF=$(ip -o addr show | grep '{}' | awk '{{print $2}}') && \
+                     echo \"Public interface: $PUBLIC_IF, Private interface: $PRIVATE_IF\" && \
+                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF -j MASQUERADE && \
+                     iptables -A FORWARD -i $PRIVATE_IF -o $PUBLIC_IF -j ACCEPT && \
+                     iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -m state --state RELATED,ESTABLISHED -j ACCEPT && \
+                     echo 'NAT router ready' && \
+                     tail -f /dev/null",
+                    public_pattern, private_pattern
+                ),
             ]),
             host_config: Some(HostConfig {
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
@@ -338,9 +498,13 @@ impl DockerNatBackend {
             ..Default::default()
         };
 
-        let router_id = self.docker
+        let router_id = self
+            .docker
             .create_container(
-                Some(CreateContainerOptions { name: router_name.clone(), ..Default::default() }),
+                Some(CreateContainerOptions {
+                    name: router_name.clone(),
+                    ..Default::default()
+                }),
                 router_config,
             )
             .await
@@ -350,13 +514,16 @@ impl DockerNatBackend {
         self.containers.push(router_id.clone());
 
         // Disconnect from default bridge network
-        let _ = self.docker.disconnect_network(
-            "bridge",
-            bollard::network::DisconnectNetworkOptions {
-                container: router_id.clone(),
-                force: true,
-            },
-        ).await;
+        let _ = self
+            .docker
+            .disconnect_network(
+                "bridge",
+                bollard::network::DisconnectNetworkOptions {
+                    container: router_id.clone(),
+                    force: true,
+                },
+            )
+            .await;
 
         // Connect router to public network (becomes eth0 after starting)
         self.docker
@@ -374,7 +541,12 @@ impl DockerNatBackend {
                 },
             )
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to connect router to public network: {}", e)))?;
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to connect router to public network: {}",
+                    e
+                ))
+            })?;
 
         // Connect router to private network (becomes eth1 after starting)
         self.docker
@@ -392,7 +564,12 @@ impl DockerNatBackend {
                 },
             )
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to connect router to private network: {}", e)))?;
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to connect router to private network: {}",
+                    e
+                ))
+            })?;
 
         // Start the router
         self.docker
@@ -405,7 +582,10 @@ impl DockerNatBackend {
 
         tracing::info!(
             "Created NAT network {} with router {} (public: {}, private: {})",
-            network_name, router_name, router_public_ip, router_private_ip
+            network_name,
+            router_name,
+            router_public_ip,
+            router_private_ip
         );
 
         Ok((network_id, router_id, router_public_ip))
@@ -454,7 +634,9 @@ WORKDIR /app
             ..Default::default()
         };
 
-        let mut build_stream = self.docker.build_image(options, None, Some(tar_data.into()));
+        let mut build_stream = self
+            .docker
+            .build_image(options, None, Some(tar_data.into()));
 
         while let Some(result) = build_stream.next().await {
             match result {
@@ -463,7 +645,10 @@ WORKDIR /app
                         tracing::debug!("Build: {}", stream.trim());
                     }
                     if let Some(error) = info.error {
-                        return Err(Error::Other(anyhow::anyhow!("Image build error: {}", error)));
+                        return Err(Error::Other(anyhow::anyhow!(
+                            "Image build error: {}",
+                            error
+                        )));
                     }
                 }
                 Err(e) => {
@@ -525,7 +710,9 @@ WORKDIR /app
         let container_name = format!("{}-gw-{}", self.config.name_prefix, index);
         let image = self.ensure_base_image().await?;
 
-        let public_network_id = self.public_network_id.as_ref()
+        let public_network_id = self
+            .public_network_id
+            .as_ref()
             .ok_or_else(|| Error::Other(anyhow::anyhow!("Public network not created yet")))?;
 
         // Gateway IP on public network
@@ -543,19 +730,18 @@ WORKDIR /app
         let config = Config {
             image: Some(image),
             hostname: Some(container_name.clone()),
-            exposed_ports: Some(HashMap::from([
-                (format!("{}/tcp", ws_port), HashMap::new()),
-            ])),
+            exposed_ports: Some(HashMap::from([(
+                format!("{}/tcp", ws_port),
+                HashMap::new(),
+            )])),
             host_config: Some(HostConfig {
-                port_bindings: Some(HashMap::from([
-                    (
-                        format!("{}/tcp", ws_port),
-                        Some(vec![PortBinding {
-                            host_ip: Some("0.0.0.0".to_string()),
-                            host_port: Some(host_ws_port.to_string()),
-                        }]),
-                    ),
-                ])),
+                port_bindings: Some(HashMap::from([(
+                    format!("{}/tcp", ws_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_ws_port.to_string()),
+                    }]),
+                )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
                 ..Default::default()
             }),
@@ -566,28 +752,43 @@ WORKDIR /app
             cmd: Some(vec![
                 "/app/freenet".to_string(),
                 "network".to_string(),
-                "--data-dir".to_string(), "/data".to_string(),
-                "--config-dir".to_string(), "/config".to_string(),
-                "--ws-api-address".to_string(), "0.0.0.0".to_string(),
-                "--ws-api-port".to_string(), ws_port.to_string(),
-                "--network-address".to_string(), "0.0.0.0".to_string(),
-                "--network-port".to_string(), network_port.to_string(),
-                "--public-network-address".to_string(), gateway_ip.to_string(),
-                "--public-network-port".to_string(), network_port.to_string(),
+                "--data-dir".to_string(),
+                "/data".to_string(),
+                "--config-dir".to_string(),
+                "/config".to_string(),
+                "--ws-api-address".to_string(),
+                "0.0.0.0".to_string(),
+                "--ws-api-port".to_string(),
+                ws_port.to_string(),
+                "--network-address".to_string(),
+                "0.0.0.0".to_string(),
+                "--network-port".to_string(),
+                network_port.to_string(),
+                "--public-network-address".to_string(),
+                gateway_ip.to_string(),
+                "--public-network-port".to_string(),
+                network_port.to_string(),
                 "--is-gateway".to_string(),
                 "--skip-load-from-network".to_string(),
-                "--transport-keypair".to_string(), "/config/keypair.pem".to_string(),
+                "--transport-keypair".to_string(),
+                "/config/keypair.pem".to_string(),
             ]),
             ..Default::default()
         };
 
-        let container_id = self.docker
+        let container_id = self
+            .docker
             .create_container(
-                Some(CreateContainerOptions { name: container_name.clone(), ..Default::default() }),
+                Some(CreateContainerOptions {
+                    name: container_name.clone(),
+                    ..Default::default()
+                }),
                 config,
             )
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to create gateway container: {}", e)))?
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!("Failed to create gateway container: {}", e))
+            })?
             .id;
 
         self.containers.push(container_id.clone());
@@ -608,12 +809,20 @@ WORKDIR /app
                 },
             )
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to connect gateway to network: {}", e)))?;
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to connect gateway to network: {}",
+                    e
+                ))
+            })?;
 
         // Copy binary and keys into container
-        self.copy_binary_to_container(&container_id, binary_path).await?;
-        self.copy_file_to_container(&container_id, keypair_path, "/config/keypair.pem").await?;
-        self.copy_file_to_container(&container_id, public_key_path, "/config/public_key.pem").await?;
+        self.copy_binary_to_container(&container_id, binary_path)
+            .await?;
+        self.copy_file_to_container(&container_id, keypair_path, "/config/keypair.pem")
+            .await?;
+        self.copy_file_to_container(&container_id, public_key_path, "/config/public_key.pem")
+            .await?;
 
         // Start container
         self.docker
@@ -638,15 +847,20 @@ WORKDIR /app
 
         tracing::info!(
             "Created gateway {} at {} (ws: localhost:{})",
-            container_name, gateway_ip, host_ws_port
+            container_name,
+            gateway_ip,
+            host_ws_port
         );
 
-        Ok((info, DockerProcess {
-            docker: self.docker.clone(),
-            container_id,
-            container_name,
-            local_log_cache,
-        }))
+        Ok((
+            info,
+            DockerProcess {
+                docker: self.docker.clone(),
+                container_id,
+                container_name,
+                local_log_cache,
+            },
+        ))
     }
 
     /// Create a peer container behind NAT
@@ -668,8 +882,9 @@ WORKDIR /app
         // Create NAT network for this peer
         let (nat_network_id, router_id, router_public_ip) = self.create_nat_network(index).await?;
 
-        // Peer's private IP (behind NAT)
-        let private_ip = Ipv4Addr::new(10, index as u8 + 1, 0, 2);
+        // Peer's private IP (behind NAT) - use the randomized base from config
+        let base = self.config.private_subnet_base.octets();
+        let private_ip = Ipv4Addr::new(base[0], base[1].wrapping_add(index as u8), 0, 2);
 
         // Allocate host port for WS API
         let host_ws_port = crate::peer::get_free_port()?;
@@ -678,19 +893,18 @@ WORKDIR /app
         let config = Config {
             image: Some(image),
             hostname: Some(container_name.clone()),
-            exposed_ports: Some(HashMap::from([
-                (format!("{}/tcp", ws_port), HashMap::new()),
-            ])),
+            exposed_ports: Some(HashMap::from([(
+                format!("{}/tcp", ws_port),
+                HashMap::new(),
+            )])),
             host_config: Some(HostConfig {
-                port_bindings: Some(HashMap::from([
-                    (
-                        format!("{}/tcp", ws_port),
-                        Some(vec![PortBinding {
-                            host_ip: Some("0.0.0.0".to_string()),
-                            host_port: Some(host_ws_port.to_string()),
-                        }]),
-                    ),
-                ])),
+                port_bindings: Some(HashMap::from([(
+                    format!("{}/tcp", ws_port),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".to_string()),
+                        host_port: Some(host_ws_port.to_string()),
+                    }]),
+                )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
                 ..Default::default()
             }),
@@ -701,22 +915,33 @@ WORKDIR /app
             cmd: Some(vec![
                 "/app/freenet".to_string(),
                 "network".to_string(),
-                "--data-dir".to_string(), "/data".to_string(),
-                "--config-dir".to_string(), "/config".to_string(),
-                "--ws-api-address".to_string(), "0.0.0.0".to_string(),
-                "--ws-api-port".to_string(), ws_port.to_string(),
-                "--network-address".to_string(), "0.0.0.0".to_string(),
-                "--network-port".to_string(), network_port.to_string(),
+                "--data-dir".to_string(),
+                "/data".to_string(),
+                "--config-dir".to_string(),
+                "/config".to_string(),
+                "--ws-api-address".to_string(),
+                "0.0.0.0".to_string(),
+                "--ws-api-port".to_string(),
+                ws_port.to_string(),
+                "--network-address".to_string(),
+                "0.0.0.0".to_string(),
+                "--network-port".to_string(),
+                network_port.to_string(),
                 // Don't set public address - let Freenet discover it via gateway
                 "--skip-load-from-network".to_string(),
-                "--transport-keypair".to_string(), "/config/keypair.pem".to_string(),
+                "--transport-keypair".to_string(),
+                "/config/keypair.pem".to_string(),
             ]),
             ..Default::default()
         };
 
-        let container_id = self.docker
+        let container_id = self
+            .docker
             .create_container(
-                Some(CreateContainerOptions { name: container_name.clone(), ..Default::default() }),
+                Some(CreateContainerOptions {
+                    name: container_name.clone(),
+                    ..Default::default()
+                }),
                 config,
             )
             .await
@@ -737,23 +962,36 @@ WORKDIR /app
                             ipv4_address: Some(private_ip.to_string()),
                             ..Default::default()
                         }),
-                        gateway: Some(Ipv4Addr::new(10, index as u8 + 1, 0, 1).to_string()),
+                        gateway: Some(
+                            Ipv4Addr::new(base[0], base[1].wrapping_add(index as u8), 0, 1)
+                                .to_string(),
+                        ),
                         ..Default::default()
                     },
                 },
             )
             .await
-            .map_err(|e| Error::Other(anyhow::anyhow!("Failed to connect peer to NAT network: {}", e)))?;
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to connect peer to NAT network: {}",
+                    e
+                ))
+            })?;
 
         // Copy binary and keys into container
-        self.copy_binary_to_container(&container_id, binary_path).await?;
-        self.copy_file_to_container(&container_id, keypair_path, "/config/keypair.pem").await?;
-        self.copy_file_to_container(&container_id, public_key_path, "/config/public_key.pem").await?;
-        self.copy_file_to_container(&container_id, gateways_toml_path, "/config/gateways.toml").await?;
+        self.copy_binary_to_container(&container_id, binary_path)
+            .await?;
+        self.copy_file_to_container(&container_id, keypair_path, "/config/keypair.pem")
+            .await?;
+        self.copy_file_to_container(&container_id, public_key_path, "/config/public_key.pem")
+            .await?;
+        self.copy_file_to_container(&container_id, gateways_toml_path, "/config/gateways.toml")
+            .await?;
 
         // Copy gateway public key if provided
         if let Some(gw_pubkey_path) = gateway_public_key_path {
-            self.copy_file_to_container(&container_id, gw_pubkey_path, "/config/gw_public_key.pem").await?;
+            self.copy_file_to_container(&container_id, gw_pubkey_path, "/config/gw_public_key.pem")
+                .await?;
         }
 
         // Start container
@@ -762,16 +1000,19 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start peer: {}", e)))?;
 
-        // Configure routing: traffic to public network (172.20.0.0/24) goes through NAT router
+        // Configure routing: traffic to public network goes through NAT router
         // Keep default route via bridge for Docker port forwarding (WebSocket access from host)
-        let router_gateway = Ipv4Addr::new(10, index as u8 + 1, 0, 254);
+        let router_gateway = Ipv4Addr::new(base[0], base[1].wrapping_add(index as u8), 0, 254);
+        let public_subnet = self.config.public_subnet;
         self.exec_in_container(
             &container_id,
-            &["sh", "-c", &format!(
-                "ip route add 172.20.0.0/24 via {}",
-                router_gateway
-            )],
-        ).await?;
+            &[
+                "sh",
+                "-c",
+                &format!("ip route add {} via {}", public_subnet, router_gateway),
+            ],
+        )
+        .await?;
 
         let info = DockerPeerInfo {
             container_id: container_id.clone(),
@@ -790,15 +1031,21 @@ WORKDIR /app
 
         tracing::info!(
             "Created peer {} at {} behind NAT {} (ws: localhost:{})",
-            container_name, private_ip, router_public_ip, host_ws_port
+            container_name,
+            private_ip,
+            router_public_ip,
+            host_ws_port
         );
 
-        Ok((info, DockerProcess {
-            docker: self.docker.clone(),
-            container_id,
-            container_name,
-            local_log_cache,
-        }))
+        Ok((
+            info,
+            DockerProcess {
+                docker: self.docker.clone(),
+                container_id,
+                container_name,
+                local_log_cache,
+            },
+        ))
     }
 
     /// Copy a file into a container (public version)
@@ -808,7 +1055,8 @@ WORKDIR /app
         local_path: &Path,
         container_path: &str,
     ) -> Result<()> {
-        self.copy_file_to_container(container_id, local_path, container_path).await
+        self.copy_file_to_container(container_id, local_path, container_path)
+            .await
     }
 
     /// Copy a file into a container
@@ -858,7 +1106,8 @@ WORKDIR /app
 
     /// Execute a command in a container
     async fn exec_in_container(&self, container_id: &str, cmd: &[&str]) -> Result<String> {
-        let exec = self.docker
+        let exec = self
+            .docker
             .create_exec(
                 container_id,
                 CreateExecOptions {
@@ -871,7 +1120,8 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to create exec: {}", e)))?;
 
-        let output = self.docker
+        let output = self
+            .docker
             .start_exec(&exec.id, None)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start exec: {}", e)))?;
@@ -897,13 +1147,18 @@ WORKDIR /app
 
         // Stop and remove containers
         for container_id in self.containers.drain(..) {
-            let _ = self.docker
+            let _ = self
+                .docker
                 .stop_container(&container_id, Some(StopContainerOptions { t: 2 }))
                 .await;
-            let _ = self.docker
+            let _ = self
+                .docker
                 .remove_container(
                     &container_id,
-                    Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
                 )
                 .await;
         }
@@ -928,30 +1183,66 @@ WORKDIR /app
 impl Drop for DockerNatBackend {
     fn drop(&mut self) {
         if self.config.cleanup_on_drop {
-            // Spawn cleanup in background since Drop is sync
+            tracing::info!("Cleaning up Docker NAT backend resources...");
+
+            // Use blocking approach to ensure cleanup completes before drop finishes
             let docker = self.docker.clone();
             let containers = std::mem::take(&mut self.containers);
             let networks = std::mem::take(&mut self.networks);
 
-            std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    for container_id in containers {
-                        let _ = docker
-                            .stop_container(&container_id, Some(StopContainerOptions { t: 1 }))
-                            .await;
-                        let _ = docker
+            // Block until cleanup completes - important for ensuring resources are freed
+            // even on panic or ctrl-c.
+            // If we're already in a runtime, use block_in_place; otherwise create a new runtime.
+            let cleanup = async {
+                // Stop and remove containers in parallel for faster cleanup
+                let container_futures = containers.into_iter().map(|container_id| {
+                    let docker = docker.clone();
+                    async move {
+                        if let Err(e) = docker
+                            .stop_container(&container_id, Some(StopContainerOptions { t: 2 }))
+                            .await
+                        {
+                            tracing::debug!("Failed to stop container {}: {}", container_id, e);
+                        }
+                        if let Err(e) = docker
                             .remove_container(
                                 &container_id,
-                                Some(RemoveContainerOptions { force: true, ..Default::default() }),
+                                Some(RemoveContainerOptions {
+                                    force: true,
+                                    ..Default::default()
+                                }),
                             )
-                            .await;
-                    }
-                    for network_id in networks {
-                        let _ = docker.remove_network(&network_id).await;
+                            .await
+                        {
+                            tracing::debug!("Failed to remove container {}: {}", container_id, e);
+                        }
                     }
                 });
-            });
+
+                // Wait for all containers to be cleaned up
+                futures::future::join_all(container_futures).await;
+
+                // Then remove networks (must happen after containers are disconnected)
+                for network_id in networks {
+                    if let Err(e) = docker.remove_network(&network_id).await {
+                        tracing::debug!("Failed to remove network {}: {}", network_id, e);
+                    }
+                }
+
+                tracing::info!("Docker NAT backend cleanup complete");
+            };
+
+            // Try to use existing runtime first (if we're in async context)
+            // Otherwise fall back to creating a new runtime
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(cleanup);
+                });
+            } else if let Ok(rt) = tokio::runtime::Runtime::new() {
+                rt.block_on(cleanup);
+            } else {
+                tracing::error!("Failed to create runtime for cleanup");
+            }
         }
     }
 }

@@ -28,7 +28,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi},
     prelude::*,
 };
-use freenet_test_network::{Backend, DockerNatConfig, FreenetBinary, TestNetwork};
+use freenet_test_network::{Backend, BuildProfile, DockerNatConfig, FreenetBinary, TestNetwork};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,11 +73,30 @@ async fn main() -> Result<()> {
     info!("Starting Docker NAT test network...");
     let start_time = std::time::Instant::now();
 
+    // Use FREENET_CORE_PATH env var if set, otherwise default to ../freenet-core/main
+    let freenet_core_path = std::env::var("FREENET_CORE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("../freenet-core/main"));
+
+    let binary = if freenet_core_path.exists() {
+        info!(
+            "Using freenet-core workspace at: {}",
+            freenet_core_path.display()
+        );
+        FreenetBinary::Workspace {
+            path: freenet_core_path,
+            profile: BuildProfile::Release,
+        }
+    } else {
+        info!("freenet-core workspace not found, using installed binary");
+        FreenetBinary::Installed
+    };
+
     let network = Arc::new(
         TestNetwork::builder()
             .gateways(1)
             .peers(1)
-            .binary(FreenetBinary::Installed)
+            .binary(binary)
             .backend(Backend::DockerNat(DockerNatConfig::default()))
             .require_connectivity(1.0)
             .connectivity_timeout(Duration::from_secs(120))
@@ -88,10 +107,7 @@ async fn main() -> Result<()> {
     );
 
     let startup_duration = start_time.elapsed();
-    info!(
-        "Network started in {:.1}s",
-        startup_duration.as_secs_f64()
-    );
+    info!("Network started in {:.1}s", startup_duration.as_secs_f64());
 
     // Log network topology
     info!("Network topology:");
@@ -173,7 +189,11 @@ async fn main() -> Result<()> {
             return Err(anyhow!("PUT failed with unexpected response"));
         }
         Err(e) => {
-            error!("PUT failed after {:.1}s: {:?}", put_start.elapsed().as_secs_f64(), e);
+            error!(
+                "PUT failed after {:.1}s: {:?}",
+                put_start.elapsed().as_secs_f64(),
+                e
+            );
 
             // Dump container logs for debugging
             dump_container_logs(&network, "put_timeout").await;
@@ -206,8 +226,8 @@ async fn main() -> Result<()> {
             info!("GET successful in {:.1}s", get_duration.as_secs_f64());
 
             // Verify the state matches
-            let retrieved_state: Ping = serde_json::from_slice(&state)
-                .context("Failed to deserialize retrieved state")?;
+            let retrieved_state: Ping =
+                serde_json::from_slice(&state).context("Failed to deserialize retrieved state")?;
 
             if retrieved_state == initial_state {
                 info!("State verification PASSED");
@@ -244,8 +264,8 @@ async fn main() -> Result<()> {
 
     match peer_get_response {
         HostResponse::ContractResponse(ContractResponse::GetResponse { state, .. }) => {
-            let peer_state: Ping = serde_json::from_slice(&state)
-                .context("Failed to deserialize peer state")?;
+            let peer_state: Ping =
+                serde_json::from_slice(&state).context("Failed to deserialize peer state")?;
             info!("Peer self-GET successful: {:?}", peer_state);
         }
         other => {
@@ -280,7 +300,8 @@ async fn connect_ws_client(ws_url: &str) -> Result<WebApi> {
 
 /// Load the ping contract code
 fn load_ping_contract() -> Result<Vec<u8>> {
-    let contract_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PING_CONTRACT_PATH);
+    let contract_path =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(PING_CONTRACT_PATH);
 
     if contract_path.exists() {
         debug!("Loading contract from: {:?}", contract_path);
