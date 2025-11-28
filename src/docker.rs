@@ -234,8 +234,12 @@ impl DockerNatBackend {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Docker ping failed: {}", e)))?;
 
-        // Clean up stale resources before creating new ones
-        Self::cleanup_stale_resources(&docker, Duration::from_secs(300)).await?;
+        // Clean up ALL stale resources before creating new ones.
+        // Use max_age=0 to remove everything with our prefix, since any existing
+        // resources are leftover from crashed/interrupted tests. This prevents
+        // "Pool overlaps with other one on this address space" errors when tests
+        // run sequentially in the same process.
+        Self::cleanup_stale_resources(&docker, Duration::ZERO).await?;
 
         Ok(Self {
             docker,
@@ -250,19 +254,29 @@ impl DockerNatBackend {
     /// Clean up stale Docker resources older than the specified duration
     ///
     /// This removes containers and networks matching the "freenet-nat-" prefix
-    /// that are older than `max_age`.
+    /// that are older than `max_age`. Pass `Duration::ZERO` to clean up ALL
+    /// matching resources regardless of age.
     async fn cleanup_stale_resources(docker: &Docker, max_age: Duration) -> Result<()> {
         use bollard::container::ListContainersOptions;
         use bollard::network::ListNetworksOptions;
 
         let now = std::time::SystemTime::now();
-        let cutoff = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
-            - max_age.as_secs() as i64;
+        let now_secs = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        // If max_age is zero, set cutoff to future to match everything
+        let cutoff = if max_age.is_zero() {
+            i64::MAX // Match everything
+        } else {
+            now_secs - max_age.as_secs() as i64
+        };
 
-        tracing::debug!(
-            "Cleaning up freenet-nat resources older than {} seconds",
-            max_age.as_secs()
-        );
+        if max_age.is_zero() {
+            tracing::debug!("Cleaning up ALL freenet-nat resources");
+        } else {
+            tracing::debug!(
+                "Cleaning up freenet-nat resources older than {} seconds",
+                max_age.as_secs()
+            );
+        }
 
         // Clean up stale containers
         let mut filters = HashMap::new();
