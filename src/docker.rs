@@ -234,12 +234,12 @@ impl DockerNatBackend {
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Docker ping failed: {}", e)))?;
 
-        // Clean up ALL stale resources before creating new ones.
-        // Use max_age=0 to remove everything with our prefix, since any existing
-        // resources are leftover from crashed/interrupted tests. This prevents
+        // Clean up stale resources before creating new ones.
+        // Use a short max_age (10 seconds) to remove resources from previous test runs
+        // while preserving any resources created in the current session. This prevents
         // "Pool overlaps with other one on this address space" errors when tests
         // run sequentially in the same process.
-        Self::cleanup_stale_resources(&docker, Duration::ZERO).await?;
+        Self::cleanup_stale_resources(&docker, Duration::from_secs(10)).await?;
 
         Ok(Self {
             docker,
