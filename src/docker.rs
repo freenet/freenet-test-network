@@ -52,8 +52,9 @@ impl Default for DockerNatConfig {
         // multiple tests sequentially. Docker cannot create networks with overlapping
         // subnets, so each test run needs a unique subnet range.
         // Using 172.16.0.0/12 private range: 172.16-31.x.x
+        // Use /16 subnet to allow peers in different /24s (different ring locations)
         let second_octet = rand::thread_rng().gen_range(16..=31);
-        let public_subnet = format!("172.{}.0.0/24", second_octet).parse().unwrap();
+        let public_subnet = format!("172.{}.0.0/16", second_octet).parse().unwrap();
 
         // Also randomize the private subnet base to avoid conflicts
         // Using 10.x.0.0 range with random first octet portion
@@ -388,34 +389,72 @@ impl DockerNatBackend {
     }
 
     /// Create the public network where gateways live
+    ///
+    /// If the initially chosen subnet conflicts with an existing Docker network,
+    /// this will retry with a different random subnet up to MAX_SUBNET_RETRIES times.
     pub async fn create_public_network(&mut self) -> Result<String> {
-        let network_name = format!("{}-public", self.config.name_prefix);
+        const MAX_SUBNET_RETRIES: usize = 10;
 
-        let options = CreateNetworkOptions {
-            name: network_name.clone(),
-            driver: "bridge".to_string(),
-            ipam: Ipam {
-                config: Some(vec![IpamConfig {
-                    subnet: Some(self.config.public_subnet.to_string()),
+        for attempt in 0..MAX_SUBNET_RETRIES {
+            let network_name = format!("{}-public", self.config.name_prefix);
+
+            let options = CreateNetworkOptions {
+                name: network_name.clone(),
+                driver: "bridge".to_string(),
+                ipam: Ipam {
+                    config: Some(vec![IpamConfig {
+                        subnet: Some(self.config.public_subnet.to_string()),
+                        ..Default::default()
+                    }]),
                     ..Default::default()
-                }]),
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        };
+            };
 
-        let response =
-            self.docker.create_network(options).await.map_err(|e| {
-                Error::Other(anyhow::anyhow!("Failed to create public network: {}", e))
-            })?;
+            match self.docker.create_network(options).await {
+                Ok(response) => {
+                    let network_id = response.id;
+                    self.networks.push(network_id.clone());
+                    self.public_network_id = Some(network_id.clone());
+                    tracing::info!(
+                        "Created public network: {} ({}) with subnet {}",
+                        network_name,
+                        network_id,
+                        self.config.public_subnet
+                    );
+                    return Ok(network_id);
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("Pool overlaps") {
+                        // Subnet conflict - pick a new random subnet and retry
+                        let old_subnet = self.config.public_subnet;
+                        let new_second_octet = rand::thread_rng().gen_range(16..=31);
+                        self.config.public_subnet =
+                            format!("172.{}.0.0/16", new_second_octet).parse().unwrap();
+                        tracing::warn!(
+                            "Subnet {} conflicts with existing network, retrying with {} (attempt {}/{})",
+                            old_subnet,
+                            self.config.public_subnet,
+                            attempt + 1,
+                            MAX_SUBNET_RETRIES
+                        );
+                        continue;
+                    }
+                    return Err(Error::Other(anyhow::anyhow!(
+                        "Failed to create public network: {}",
+                        e
+                    )));
+                }
+            }
+        }
 
-        let network_id = response.id;
-
-        self.networks.push(network_id.clone());
-        self.public_network_id = Some(network_id.clone());
-
-        tracing::info!("Created public network: {} ({})", network_name, network_id);
-        Ok(network_id)
+        Err(Error::Other(anyhow::anyhow!(
+            "Failed to create public network after {} attempts due to subnet conflicts. \
+             This may indicate stale Docker networks. Try running: \
+             docker network ls | grep freenet-nat | awk '{{print $1}}' | xargs -r docker network rm",
+            MAX_SUBNET_RETRIES
+        )))
     }
 
     /// Create a private network behind NAT for a peer
@@ -463,11 +502,14 @@ impl DockerNatBackend {
             .ok_or_else(|| Error::Other(anyhow::anyhow!("Public network not created yet")))?;
 
         // NAT router IP addresses
+        // Each peer gets an IP in a different /24 subnet to ensure different ring locations
+        // E.g., peer 0 -> 172.X.0.100, peer 1 -> 172.X.1.100, peer 2 -> 172.X.2.100
+        // This way, Location::from_address (which masks last byte) gives each peer a different location
         let router_public_ip = Ipv4Addr::new(
             self.config.public_subnet.ip().octets()[0],
             self.config.public_subnet.ip().octets()[1],
-            0,
-            100 + peer_index as u8,
+            peer_index as u8, // Different /24 per peer for unique ring locations
+            100,              // Fixed host part within each /24
         );
         // Use .254 for router to avoid conflict with Docker's default gateway at .1
         let router_private_ip =
@@ -493,11 +535,13 @@ impl DockerNatBackend {
                     "apk add --no-cache iptables iproute2 > /dev/null 2>&1 && \
                      PUBLIC_IF=$(ip -o addr show | grep '{}' | awk '{{print $2}}') && \
                      PRIVATE_IF=$(ip -o addr show | grep '{}' | awk '{{print $2}}') && \
-                     echo \"Public interface: $PUBLIC_IF, Private interface: $PRIVATE_IF\" && \
-                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF -j MASQUERADE && \
+                     PUBLIC_IP=$(ip -o addr show dev $PUBLIC_IF | awk '/inet / {{split($4,a,\"/\"); print a[1]}}') && \
+                     echo \"Public interface: $PUBLIC_IF ($PUBLIC_IP), Private interface: $PRIVATE_IF\" && \
+                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp -j SNAT --to-source $PUBLIC_IP:31337 && \
+                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF ! -p udp -j MASQUERADE && \
                      iptables -A FORWARD -i $PRIVATE_IF -o $PUBLIC_IF -j ACCEPT && \
-                     iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -m state --state RELATED,ESTABLISHED -j ACCEPT && \
-                     echo 'NAT router ready' && \
+                     iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -j ACCEPT && \
+                     echo 'Cone NAT router ready' && \
                      tail -f /dev/null",
                     public_pattern, private_pattern
                 ),
