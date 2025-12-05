@@ -1,4 +1,5 @@
 use crate::{process::PeerProcess, remote::PeerLocation, Result};
+use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 
 /// Represents a single peer in the test network
@@ -68,7 +69,7 @@ impl TestPeer {
 
 /// Get a free port by binding to port 0 and letting the OS assign one
 pub(crate) fn get_free_port() -> Result<u16> {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    // Use UDP to mirror the freenet transport listener and avoid conflicts with UDP-only bindings.
+    let socket = UdpSocket::bind("127.0.0.1:0")?;
+    Ok(socket.local_addr()?.port())
 }
