@@ -525,25 +525,43 @@ impl DockerNatBackend {
         let peer_private_ip = Ipv4Addr::new(base[0], base[1].wrapping_add(peer_index as u8), 0, 2);
 
         // Build iptables rules based on NAT type
-        // Default: Full Cone NAT (port forwarding) - supports hole punching
-        // Optional: Symmetric NAT (MASQUERADE only) - does NOT support hole punching
         //
-        // Note: Linux iptables MASQUERADE behaves like symmetric NAT with endpoint-dependent
-        // port mapping. This means each outbound connection to a different destination gets
-        // a different source port, breaking UDP hole punching. Full cone NAT (DNAT) is the
-        // default because it accurately tests P2P connectivity for the majority of NAT types
-        // that support hole punching (full cone, restricted cone, port-restricted cone).
-        let dnat_rules = if std::env::var("FREENET_TEST_SYMMETRIC_NAT").is_ok() {
-            // Symmetric NAT: Only MASQUERADE, no DNAT - hole punching will NOT work
-            // Use this to test scenarios where direct P2P connectivity fails
-            String::new()
-        } else {
-            // Full Cone NAT (default): Add DNAT rules to forward all traffic on port 31337 to peer
-            // This simulates port forwarding / UPnP where inbound traffic is allowed
+        // NAT Types (from most permissive to most restrictive):
+        // 1. Full Cone: Any external host can send to mapped port (like port forwarding)
+        // 2. Address-Restricted Cone: Only hosts the peer has contacted can send back
+        // 3. Port-Restricted Cone: Only host:port pairs the peer has contacted can send back
+        // 4. Symmetric: Different mapping for each destination (breaks hole punching)
+        //
+        // Default: Port-Restricted Cone NAT - the most common residential NAT type
+        // This requires proper UDP hole-punching: peer must send packet to remote's public
+        // IP:port first, which creates a NAT mapping that allows return traffic.
+        //
+        // The key insight: Linux conntrack already provides port-restricted cone behavior
+        // by default with MASQUERADE - it allows return traffic from the exact IP:port
+        // that received outbound traffic. We just need to NOT add blanket DNAT rules.
+        let dnat_rules = if std::env::var("FREENET_TEST_FULL_CONE_NAT").is_ok() {
+            // Full Cone NAT: Add DNAT rules to forward all traffic on port 31337 to peer
+            // This simulates port forwarding / UPnP - unrealistic for testing hole punching
             format!(
                 "iptables -t nat -A PREROUTING -i $PUBLIC_IF -p udp --dport 31337 -j DNAT --to-destination {}:31337 && \
                  echo 'Full Cone NAT: DNAT rule added for port 31337 -> {}:31337' && ",
                 peer_private_ip, peer_private_ip
+            )
+        } else if std::env::var("FREENET_TEST_SYMMETRIC_NAT").is_ok() {
+            // Symmetric NAT: Use random source ports for each destination
+            // This breaks UDP hole punching entirely
+            format!(
+                "iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp -j MASQUERADE --random && \
+                 echo 'Symmetric NAT: Random port mapping enabled (hole punching will fail)' && "
+            )
+        } else {
+            // Port-Restricted Cone NAT (default): Realistic residential NAT
+            // - Outbound traffic creates NAT mapping (conntrack entry)
+            // - Only return traffic from the same remote IP:port is allowed through
+            // - No pre-configured port forwarding
+            // - Requires proper hole-punching coordination via signaling
+            String::from(
+                "echo 'Port-Restricted Cone NAT: No DNAT rules - hole punching required' && "
             )
         };
 
