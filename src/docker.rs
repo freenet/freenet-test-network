@@ -521,6 +521,32 @@ impl DockerNatBackend {
         let public_octets = self.config.public_subnet.ip().octets();
         let public_pattern = format!("172\\.{}\\.", public_octets[1]);
         let private_pattern = format!(" {}\\.", base[0]);
+        // Calculate peer's private IP (matches what create_peer will use)
+        let peer_private_ip = Ipv4Addr::new(base[0], base[1].wrapping_add(peer_index as u8), 0, 2);
+
+        // Build iptables rules based on NAT type
+        // Default: Full Cone NAT (port forwarding) - supports hole punching
+        // Optional: Symmetric NAT (MASQUERADE only) - does NOT support hole punching
+        //
+        // Note: Linux iptables MASQUERADE behaves like symmetric NAT with endpoint-dependent
+        // port mapping. This means each outbound connection to a different destination gets
+        // a different source port, breaking UDP hole punching. Full cone NAT (DNAT) is the
+        // default because it accurately tests P2P connectivity for the majority of NAT types
+        // that support hole punching (full cone, restricted cone, port-restricted cone).
+        let dnat_rules = if std::env::var("FREENET_TEST_SYMMETRIC_NAT").is_ok() {
+            // Symmetric NAT: Only MASQUERADE, no DNAT - hole punching will NOT work
+            // Use this to test scenarios where direct P2P connectivity fails
+            String::new()
+        } else {
+            // Full Cone NAT (default): Add DNAT rules to forward all traffic on port 31337 to peer
+            // This simulates port forwarding / UPnP where inbound traffic is allowed
+            format!(
+                "iptables -t nat -A PREROUTING -i $PUBLIC_IF -p udp --dport 31337 -j DNAT --to-destination {}:31337 && \
+                 echo 'Full Cone NAT: DNAT rule added for port 31337 -> {}:31337' && ",
+                peer_private_ip, peer_private_ip
+            )
+        };
+
         let router_config = Config {
             image: Some("alpine:latest".to_string()),
             hostname: Some(router_name.clone()),
@@ -537,13 +563,12 @@ impl DockerNatBackend {
                      PRIVATE_IF=$(ip -o addr show | grep '{}' | awk '{{print $2}}') && \
                      PUBLIC_IP=$(ip -o addr show dev $PUBLIC_IF | awk '/inet / {{split($4,a,\"/\"); print a[1]}}') && \
                      echo \"Public interface: $PUBLIC_IF ($PUBLIC_IP), Private interface: $PRIVATE_IF\" && \
-                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp -j SNAT --to-source $PUBLIC_IP:31337 && \
-                     iptables -t nat -A POSTROUTING -o $PUBLIC_IF ! -p udp -j MASQUERADE && \
+                     {}iptables -t nat -A POSTROUTING -o $PUBLIC_IF -j MASQUERADE && \
                      iptables -A FORWARD -i $PRIVATE_IF -o $PUBLIC_IF -j ACCEPT && \
                      iptables -A FORWARD -i $PUBLIC_IF -o $PRIVATE_IF -j ACCEPT && \
-                     echo 'Cone NAT router ready' && \
+                     echo 'NAT router ready' && \
                      tail -f /dev/null",
-                    public_pattern, private_pattern
+                    public_pattern, private_pattern, dnat_rules
                 ),
             ]),
             host_config: Some(HostConfig {
