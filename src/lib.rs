@@ -18,11 +18,14 @@ pub use docker::{DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology,
 pub use logs::LogEntry;
 pub use network::{
     ring_nodes_from_diagnostics, write_ring_visualization_from_diagnostics,
-    NetworkDiagnosticsSnapshot, NetworkTopology, PeerDiagnosticsSnapshot, RingPeerSnapshot,
-    RingVizMetrics, TestNetwork,
+    NetworkDiagnosticsSnapshot, NetworkTopology, PeerContractStatus, PeerDiagnosticsSnapshot,
+    RingPeerSnapshot, RingVizMetrics, TestNetwork,
 };
 pub use peer::TestPeer;
 pub use remote::{PeerLocation, RemoteMachine};
+
+// Re-export ContractKey for use with collect_ring_snapshot
+pub use freenet_stdlib::prelude::ContractKey;
 
 /// Result type used throughout this crate
 pub type Result<T> = std::result::Result<T, Error>;

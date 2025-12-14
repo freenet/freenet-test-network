@@ -388,7 +388,11 @@ impl TestNetwork {
         self.collect_ring_snapshot(None).await
     }
 
-    async fn collect_ring_snapshot(
+    /// Collect per-peer ring data with optional contract-specific subscription info.
+    ///
+    /// When `contract_key` is provided, each `RingPeerSnapshot` will include
+    /// `PeerContractStatus` with subscriber information for that contract.
+    pub async fn collect_ring_snapshot(
         &self,
         contract_key: Option<&ContractKey>,
     ) -> Result<Vec<RingPeerSnapshot>> {
