@@ -688,6 +688,29 @@ impl TestNetwork {
             println!("--- No Docker NAT backend (conntrack not available) ---");
         }
     }
+
+    /// Dump routing tables from all peer containers (Docker NAT only)
+    ///
+    /// Shows ip route output for debugging routing issues.
+    pub async fn dump_peer_routes(&self) {
+        if let Some(backend) = &self.docker_backend {
+            match backend.dump_peer_routes().await {
+                Ok(results) => {
+                    println!("--- Peer routing tables ---");
+                    for (peer_idx, output) in results.iter() {
+                        println!("=== Peer {} routes ===", peer_idx);
+                        println!("{}", output);
+                    }
+                    println!("--- End peer routing tables ---");
+                }
+                Err(e) => {
+                    println!("--- Failed to dump peer routes: {} ---", e);
+                }
+            }
+        } else {
+            println!("--- No Docker NAT backend (peer routes not available) ---");
+        }
+    }
 }
 
 impl TestNetwork {

@@ -556,12 +556,25 @@ impl DockerNatBackend {
             )
         } else {
             // Port-Restricted Cone NAT (default): Realistic residential NAT
-            // - Outbound traffic creates NAT mapping (conntrack entry)
-            // - Only return traffic from the same remote IP:port is allowed through
-            // - No pre-configured port forwarding
-            // - Requires proper hole-punching coordination via signaling
-            String::from(
-                "echo 'Port-Restricted Cone NAT: No DNAT rules - hole punching required' && "
+            //
+            // Residential NATs typically have two properties (RFC 4787):
+            // 1. Endpoint-Independent Mapping (EIM): Same internal IP:port maps to same
+            //    external port regardless of destination
+            // 2. Port-Restricted Cone Filtering: Only allow inbound from IP:port pairs
+            //    that we've previously sent to (handled by conntrack)
+            //
+            // Implementation:
+            // - DNAT: Forward incoming UDP/31337 to internal peer (enables hole punching)
+            // - SNAT: Preserve port 31337 on outbound (EIM behavior)
+            // - Conntrack handles port-restricted filtering automatically
+            //
+            // Note: Without DNAT, incoming packets to the NAT's public IP are delivered
+            // to the router itself (INPUT chain) rather than forwarded to the internal peer.
+            format!(
+                "echo 'Port-Restricted Cone NAT: EIM + port-restricted filtering' && \
+                 iptables -t nat -A PREROUTING -i $PUBLIC_IF -p udp --dport 31337 -j DNAT --to-destination {}:31337 && \
+                 iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp --sport 31337 -j SNAT --to-source $PUBLIC_IP:31337 && ",
+                peer_private_ip
             )
         };
 
@@ -847,7 +860,7 @@ WORKDIR /app
                 ..Default::default()
             }),
             env: Some(vec![
-                "RUST_LOG=info".to_string(),
+                format!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())),
                 "RUST_BACKTRACE=1".to_string(),
             ]),
             cmd: Some(vec![
@@ -1010,7 +1023,7 @@ WORKDIR /app
                 ..Default::default()
             }),
             env: Some(vec![
-                "RUST_LOG=info".to_string(),
+                format!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())),
                 "RUST_BACKTRACE=1".to_string(),
             ]),
             cmd: Some(vec![
@@ -1339,6 +1352,25 @@ WORKDIR /app
                     Err(e) => {
                         results.insert(peer_index, format!("Error: {}", e));
                     }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Dump routing tables from all peer containers
+    ///
+    /// Shows the ip route table for each peer, useful for debugging NAT connectivity.
+    pub async fn dump_peer_routes(&self) -> Result<std::collections::HashMap<usize, String>> {
+        let mut results = std::collections::HashMap::new();
+
+        for (&peer_index, peer_info) in &self.peer_containers {
+            if peer_info.nat_router_id.is_some() {
+                // Get route table from the peer container
+                match self.exec_in_container(&peer_info.container_id, &["ip", "route"]).await {
+                    Ok(s) => { results.insert(peer_index, s); }
+                    Err(e) => { results.insert(peer_index, format!("Error: {}", e)); }
                 }
             }
         }
