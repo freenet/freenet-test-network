@@ -36,6 +36,18 @@ impl TestPeer {
         &self.network_address
     }
 
+    /// Get the peer's network port
+    pub fn network_port(&self) -> u16 {
+        self.network_port
+    }
+
+    /// Get the peer's full socket address (address:port)
+    pub fn socket_address(&self) -> std::net::SocketAddr {
+        format!("{}:{}", self.network_address, self.network_port)
+            .parse()
+            .expect("valid socket address")
+    }
+
     /// Get the root data directory for this peer
     pub fn data_dir_path(&self) -> &Path {
         &self.data_dir

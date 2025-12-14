@@ -556,6 +556,92 @@ impl TestNetwork {
         }
         Ok(data)
     }
+
+    /// Dump logs from all peers, optionally filtered by a pattern
+    ///
+    /// If `filter` is Some, only logs containing the pattern (case-insensitive) are printed.
+    /// Logs are printed in chronological order with peer ID prefix.
+    ///
+    /// This is useful for debugging test failures - call it before assertions or in error handlers.
+    pub fn dump_logs(&self, filter: Option<&str>) {
+        match self.read_logs() {
+            Ok(mut entries) => {
+                // Sort by timestamp
+                entries.sort_by(|a, b| match (&a.timestamp, &b.timestamp) {
+                    (Some(ta), Some(tb)) => ta.cmp(tb),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
+
+                let filter_lower = filter.map(|f| f.to_lowercase());
+                let mut count = 0;
+
+                println!("--- Peer Logs {} ---",
+                    filter.map(|f| format!("(filtered: '{}')", f)).unwrap_or_default());
+
+                for entry in &entries {
+                    let matches = filter_lower
+                        .as_ref()
+                        .map(|f| entry.message.to_lowercase().contains(f))
+                        .unwrap_or(true);
+
+                    if matches {
+                        let ts = entry.timestamp_raw.as_deref().unwrap_or("?");
+                        let level = entry.level.as_deref().unwrap_or("?");
+                        println!("[{}] {} [{}] {}", entry.peer_id, ts, level, entry.message);
+                        count += 1;
+                    }
+                }
+
+                println!("--- End Peer Logs ({} entries) ---", count);
+            }
+            Err(e) => {
+                println!("--- Failed to read logs: {} ---", e);
+            }
+        }
+    }
+
+    /// Dump logs related to connection establishment and NAT traversal
+    ///
+    /// Filters for: hole punch, NAT, connect, acceptor, joiner, handshake
+    pub fn dump_connection_logs(&self) {
+        match self.read_logs() {
+            Ok(mut entries) => {
+                entries.sort_by(|a, b| match (&a.timestamp, &b.timestamp) {
+                    (Some(ta), Some(tb)) => ta.cmp(tb),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
+
+                let keywords = [
+                    "hole", "punch", "nat", "traverse", "acceptor", "joiner",
+                    "handshake", "outbound", "inbound", "connect:", "connection",
+                ];
+
+                println!("--- Connection/NAT Logs ---");
+                let mut count = 0;
+
+                for entry in &entries {
+                    let msg_lower = entry.message.to_lowercase();
+                    let matches = keywords.iter().any(|kw| msg_lower.contains(kw));
+
+                    if matches {
+                        let ts = entry.timestamp_raw.as_deref().unwrap_or("?");
+                        let level = entry.level.as_deref().unwrap_or("?");
+                        println!("[{}] {} [{}] {}", entry.peer_id, ts, level, entry.message);
+                        count += 1;
+                    }
+                }
+
+                println!("--- End Connection/NAT Logs ({} entries) ---", count);
+            }
+            Err(e) => {
+                println!("--- Failed to read logs: {} ---", e);
+            }
+        }
+    }
 }
 
 impl TestNetwork {
