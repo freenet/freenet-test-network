@@ -1279,6 +1279,72 @@ WORKDIR /app
     pub fn get_peer_info(&self, index: usize) -> Option<&DockerPeerInfo> {
         self.peer_containers.get(&index)
     }
+
+    /// Dump iptables NAT rules and packet counters from all NAT routers
+    ///
+    /// Returns a map of peer_index -> iptables output showing:
+    /// - NAT table rules with packet/byte counters
+    /// - FORWARD chain counters
+    pub async fn dump_iptables_counters(&self) -> Result<std::collections::HashMap<usize, String>> {
+        let mut results = std::collections::HashMap::new();
+
+        for (&peer_index, peer_info) in &self.peer_containers {
+            if let Some(router_id) = &peer_info.nat_router_id {
+                let mut output = String::new();
+
+                // Get NAT table with counters
+                output.push_str("=== NAT table ===\n");
+                match self.exec_in_container(router_id, &["iptables", "-t", "nat", "-nvL"]).await {
+                    Ok(s) => output.push_str(&s),
+                    Err(e) => output.push_str(&format!("Error: {}\n", e)),
+                }
+
+                // Get FORWARD chain with counters
+                output.push_str("\n=== FORWARD chain ===\n");
+                match self.exec_in_container(router_id, &["iptables", "-nvL", "FORWARD"]).await {
+                    Ok(s) => output.push_str(&s),
+                    Err(e) => output.push_str(&format!("Error: {}\n", e)),
+                }
+
+                results.insert(peer_index, output);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Dump conntrack table from all NAT routers
+    ///
+    /// Shows active NAT connection tracking entries for UDP traffic.
+    /// Note: Installs conntrack-tools if not present (adds ~2s per router first time).
+    pub async fn dump_conntrack_table(&self) -> Result<std::collections::HashMap<usize, String>> {
+        let mut results = std::collections::HashMap::new();
+
+        for (&peer_index, peer_info) in &self.peer_containers {
+            if let Some(router_id) = &peer_info.nat_router_id {
+                // Install conntrack-tools if needed
+                let _ = self.exec_in_container(
+                    router_id,
+                    &["apk", "add", "--no-cache", "conntrack-tools"]
+                ).await;
+
+                // Get conntrack entries for UDP
+                match self.exec_in_container(router_id, &["conntrack", "-L", "-p", "udp"]).await {
+                    Ok(s) if s.trim().is_empty() => {
+                        results.insert(peer_index, "(no UDP conntrack entries)".to_string());
+                    }
+                    Ok(s) => {
+                        results.insert(peer_index, s);
+                    }
+                    Err(e) => {
+                        results.insert(peer_index, format!("Error: {}", e));
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 impl Drop for DockerNatBackend {

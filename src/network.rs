@@ -642,6 +642,52 @@ impl TestNetwork {
             }
         }
     }
+
+    /// Dump iptables counters from all NAT routers (Docker NAT only)
+    ///
+    /// Prints NAT table rules and FORWARD chain counters for debugging.
+    pub async fn dump_iptables(&self) {
+        if let Some(backend) = &self.docker_backend {
+            match backend.dump_iptables_counters().await {
+                Ok(results) => {
+                    println!("--- NAT Router iptables ---");
+                    for (peer_idx, output) in results.iter() {
+                        println!("=== Peer {} NAT Router ===", peer_idx);
+                        println!("{}", output);
+                    }
+                    println!("--- End NAT Router iptables ---");
+                }
+                Err(e) => {
+                    println!("--- Failed to dump iptables: {} ---", e);
+                }
+            }
+        } else {
+            println!("--- No Docker NAT backend (iptables not available) ---");
+        }
+    }
+
+    /// Dump conntrack table from all NAT routers (Docker NAT only)
+    ///
+    /// Shows active UDP connection tracking entries for debugging NAT issues.
+    pub async fn dump_conntrack(&self) {
+        if let Some(backend) = &self.docker_backend {
+            match backend.dump_conntrack_table().await {
+                Ok(results) => {
+                    println!("--- NAT Router conntrack ---");
+                    for (peer_idx, output) in results.iter() {
+                        println!("=== Peer {} NAT Router ===", peer_idx);
+                        println!("{}", output);
+                    }
+                    println!("--- End NAT Router conntrack ---");
+                }
+                Err(e) => {
+                    println!("--- Failed to dump conntrack: {} ---", e);
+                }
+            }
+        } else {
+            println!("--- No Docker NAT backend (conntrack not available) ---");
+        }
+    }
 }
 
 impl TestNetwork {
