@@ -837,10 +837,7 @@ WORKDIR /app
             10 + index as u8,
         );
 
-        // Allocate host port for WS API
-        let host_ws_port = crate::peer::get_free_port()?;
-
-        // Create container
+        // Create container - let Docker auto-allocate host port to avoid TOCTOU race
         let config = Config {
             image: Some(image),
             hostname: Some(container_name.clone()),
@@ -853,7 +850,7 @@ WORKDIR /app
                     format!("{}/tcp", ws_port),
                     Some(vec![PortBinding {
                         host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(host_ws_port.to_string()),
+                        host_port: None, // Let Docker auto-allocate to avoid port conflicts
                     }]),
                 )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
@@ -944,6 +941,11 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start gateway: {}", e)))?;
 
+        // Get the Docker-allocated host port by inspecting the running container
+        let host_ws_port = self
+            .get_container_host_port(&container_id, ws_port)
+            .await?;
+
         let info = DockerPeerInfo {
             container_id: container_id.clone(),
             container_name: container_name.clone(),
@@ -1000,10 +1002,7 @@ WORKDIR /app
         let base = self.config.private_subnet_base.octets();
         let private_ip = Ipv4Addr::new(base[0], base[1].wrapping_add(index as u8), 0, 2);
 
-        // Allocate host port for WS API
-        let host_ws_port = crate::peer::get_free_port()?;
-
-        // Create container
+        // Create container - let Docker auto-allocate host port to avoid TOCTOU race
         let config = Config {
             image: Some(image),
             hostname: Some(container_name.clone()),
@@ -1016,7 +1015,7 @@ WORKDIR /app
                     format!("{}/tcp", ws_port),
                     Some(vec![PortBinding {
                         host_ip: Some("0.0.0.0".to_string()),
-                        host_port: Some(host_ws_port.to_string()),
+                        host_port: None, // Let Docker auto-allocate to avoid port conflicts
                     }]),
                 )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
@@ -1113,6 +1112,11 @@ WORKDIR /app
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start peer: {}", e)))?;
+
+        // Get the Docker-allocated host port by inspecting the running container
+        let host_ws_port = self
+            .get_container_host_port(&container_id, ws_port)
+            .await?;
 
         // Configure routing: traffic to public network goes through NAT router
         // Keep default route via bridge for Docker port forwarding (WebSocket access from host)
@@ -1376,6 +1380,45 @@ WORKDIR /app
         }
 
         Ok(results)
+    }
+
+    /// Get the host port allocated by Docker for a container's exposed port.
+    ///
+    /// This is used after starting a container to discover which host port Docker
+    /// auto-allocated when we specified `host_port: None` in the port binding.
+    /// This approach avoids TOCTOU race conditions that can occur when pre-allocating
+    /// ports with `get_free_port()` and then trying to bind them in Docker.
+    async fn get_container_host_port(&self, container_id: &str, container_port: u16) -> Result<u16> {
+        let info = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to inspect container for port allocation: {}",
+                    e
+                ))
+            })?;
+
+        let port_key = format!("{}/tcp", container_port);
+
+        let host_port = info
+            .network_settings
+            .and_then(|ns| ns.ports)
+            .and_then(|ports| ports.get(&port_key).cloned())
+            .flatten()
+            .and_then(|bindings| bindings.first().cloned())
+            .and_then(|binding| binding.host_port)
+            .and_then(|port_str| port_str.parse::<u16>().ok())
+            .ok_or_else(|| {
+                Error::Other(anyhow::anyhow!(
+                    "Failed to get allocated host port for container {} port {}",
+                    container_id,
+                    container_port
+                ))
+            })?;
+
+        Ok(host_port)
     }
 }
 
