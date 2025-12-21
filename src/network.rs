@@ -411,24 +411,18 @@ impl TestNetwork {
     }
 
     /// Generate an interactive HTML ring visualization for a specific contract.
+    ///
+    /// Note: This function now takes a ContractKey directly instead of a string,
+    /// since freenet-stdlib 0.1.27 no longer supports ContractKey::from_id.
+    /// The contract_id string is used for display purposes.
     pub async fn write_ring_visualization_for_contract<P: AsRef<Path>>(
         &self,
         output_path: P,
+        contract_key: &ContractKey,
         contract_id: &str,
     ) -> Result<()> {
-        let contract_id_owned = contract_id.to_string();
-        let contract_key = ContractKey::from_id(contract_id_owned.clone()).map_err(|err| {
-            Error::Other(anyhow::anyhow!(
-                "invalid contract key {}: {}",
-                contract_id,
-                err
-            ))
-        })?;
-        self.write_ring_visualization_internal(
-            output_path,
-            Some((&contract_key, contract_id_owned.as_str())),
-        )
-        .await
+        self.write_ring_visualization_internal(output_path, Some((contract_key, contract_id)))
+            .await
     }
 
     async fn write_ring_visualization_internal<P: AsRef<Path>>(
