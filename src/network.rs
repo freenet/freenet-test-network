@@ -5,7 +5,7 @@ use freenet_stdlib::{
         ClientRequest, ConnectedPeerInfo, HostResponse, NodeDiagnosticsConfig, NodeQuery,
         QueryResponse, SystemMetrics, WebApi,
     },
-    prelude::ContractKey,
+    prelude::{CodeHash, ContractInstanceId, ContractKey},
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -390,15 +390,15 @@ impl TestNetwork {
 
     /// Collect per-peer ring data with optional contract-specific subscription info.
     ///
-    /// When `contract_key` is provided, each `RingPeerSnapshot` will include
+    /// When `instance_id` is provided, each `RingPeerSnapshot` will include
     /// `PeerContractStatus` with subscriber information for that contract.
     pub async fn collect_ring_snapshot(
         &self,
-        contract_key: Option<&ContractKey>,
+        instance_id: Option<&ContractInstanceId>,
     ) -> Result<Vec<RingPeerSnapshot>> {
         let mut snapshots = Vec::with_capacity(self.gateways.len() + self.peers.len());
         for peer in self.gateways.iter().chain(self.peers.iter()) {
-            snapshots.push(query_ring_snapshot(peer, contract_key).await?);
+            snapshots.push(query_ring_snapshot(peer, instance_id).await?);
         }
         snapshots.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(snapshots)
@@ -421,17 +421,17 @@ impl TestNetwork {
         contract_key: &ContractKey,
         contract_id: &str,
     ) -> Result<()> {
-        self.write_ring_visualization_internal(output_path, Some((contract_key, contract_id)))
+        self.write_ring_visualization_internal(output_path, Some((contract_key.id(), contract_id)))
             .await
     }
 
     async fn write_ring_visualization_internal<P: AsRef<Path>>(
         &self,
         output_path: P,
-        contract: Option<(&ContractKey, &str)>,
+        contract: Option<(&ContractInstanceId, &str)>,
     ) -> Result<()> {
-        let (snapshots, contract_viz) = if let Some((contract_key, contract_id)) = contract {
-            let snapshots = self.collect_ring_snapshot(Some(contract_key)).await?;
+        let (snapshots, contract_viz) = if let Some((instance_id, contract_id)) = contract {
+            let snapshots = self.collect_ring_snapshot(Some(instance_id)).await?;
             let caching_peers = snapshots
                 .iter()
                 .filter(|peer| {
@@ -442,7 +442,7 @@ impl TestNetwork {
                 })
                 .map(|peer| peer.id.clone())
                 .collect::<Vec<_>>();
-            let contract_location = contract_location_from_key(contract_key);
+            let contract_location = contract_location_from_instance_id(instance_id);
             let flow = self.collect_contract_flow(contract_id, &snapshots)?;
             let viz = ContractVizData {
                 key: contract_id.to_string(),
@@ -963,7 +963,7 @@ struct ContractFlowData {
 
 async fn query_ring_snapshot(
     peer: &TestPeer,
-    contract_key: Option<&ContractKey>,
+    instance_id: Option<&ContractInstanceId>,
 ) -> Result<RingPeerSnapshot> {
     use tokio_tungstenite::connect_async;
 
@@ -976,12 +976,16 @@ async fn query_ring_snapshot(
         })?;
 
     let mut client = WebApi::start(ws_stream);
-    let diag_config = if let Some(key) = contract_key {
+    let diag_config = if let Some(id) = instance_id {
+        // Create a ContractKey with placeholder code hash for the diagnostics API.
+        // The code hash is not used for contract lookup/filtering, only the instance ID matters.
+        let placeholder_key =
+            ContractKey::from_id_and_code(*id, CodeHash::new([0u8; 32]));
         NodeDiagnosticsConfig {
             include_node_info: true,
             include_network_info: true,
             include_subscriptions: true,
-            contract_keys: vec![key.clone()],
+            contract_keys: vec![placeholder_key],
             include_system_metrics: false,
             include_detailed_peer_info: true,
             include_subscriber_peer_ids: true,
@@ -1061,9 +1065,11 @@ async fn query_ring_snapshot(
     connections.sort();
     connections.dedup();
 
-    let contract_status = contract_key.and_then(|key| {
+    let contract_status = instance_id.and_then(|id| {
+        // Create placeholder key for contract_states lookup (keyed by ContractKey)
+        let placeholder_key = ContractKey::from_id_and_code(*id, CodeHash::new([0u8; 32]));
         let (stores_contract, subscriber_count, subscriber_peer_ids) =
-            if let Some(state) = diag.contract_states.get(key) {
+            if let Some(state) = diag.contract_states.get(&placeholder_key) {
                 (
                     true,
                     state.subscribers as usize,
@@ -1072,10 +1078,11 @@ async fn query_ring_snapshot(
             } else {
                 (false, 0, Vec::new())
             };
+        // SubscriptionInfo.contract_key is now ContractInstanceId
         let subscribed_locally = diag
             .subscriptions
             .iter()
-            .any(|sub| &sub.contract_key == key);
+            .any(|sub| &sub.contract_key == id);
         if stores_contract || subscribed_locally {
             Some(PeerContractStatus {
                 stores_contract,
@@ -1240,10 +1247,10 @@ fn resolve_peer_id(prefix: &str, peers: &[RingPeerSnapshot]) -> Option<String> {
         .map(|peer| peer.id.clone())
 }
 
-fn contract_location_from_key(key: &ContractKey) -> f64 {
+fn contract_location_from_instance_id(id: &ContractInstanceId) -> f64 {
     let mut value = 0.0;
     let mut divisor = 256.0;
-    for byte in key.as_bytes() {
+    for byte in id.as_bytes() {
         value += f64::from(*byte) / divisor;
         divisor *= 256.0;
     }
