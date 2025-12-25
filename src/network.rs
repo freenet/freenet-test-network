@@ -18,6 +18,16 @@ use std::{
     time::Duration,
 };
 
+/// Gracefully close a WebSocket client connection.
+///
+/// This sends a Disconnect message and waits briefly for the close handshake to complete,
+/// preventing "Connection reset without closing handshake" errors on the server.
+async fn graceful_disconnect(client: WebApi, reason: &'static str) {
+    client.disconnect(reason).await;
+    // Brief delay to allow the close handshake to complete
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
 /// Detailed connectivity status for a single peer
 #[derive(Debug, Clone)]
 pub struct PeerConnectivityStatus {
@@ -254,7 +264,7 @@ impl TestNetwork {
             Err(e) => Err(Error::ConnectivityFailed(format!("Query failed: {}", e))),
         };
 
-        client.disconnect("connectivity probe").await;
+        graceful_disconnect(client, "connectivity probe").await;
 
         result
     }
@@ -328,6 +338,7 @@ impl TestNetwork {
                     .await
                 {
                     snapshot.error = Some(format!("failed to send diagnostics request: {err}"));
+                    graceful_disconnect(client, "diagnostics send error").await;
                     return snapshot;
                 }
                 match tokio::time::timeout(std::time::Duration::from_secs(10), client.recv()).await
@@ -372,6 +383,7 @@ impl TestNetwork {
                         snapshot.error = Some("timeout waiting for diagnostics response".into());
                     }
                 }
+                graceful_disconnect(client, "diagnostics complete").await;
             }
             Ok(Err(err)) => {
                 snapshot.error = Some(format!("failed to connect websocket: {err}"));
@@ -1019,7 +1031,7 @@ async fn query_ring_snapshot(
     let diag = match response {
         Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(diag))) => diag,
         Ok(other) => {
-            client.disconnect("ring snapshot error").await;
+            graceful_disconnect(client, "ring snapshot error").await;
             return Err(Error::ConnectivityFailed(format!(
                 "Unexpected diagnostics response from {}: {:?}",
                 peer.id(),
@@ -1027,7 +1039,7 @@ async fn query_ring_snapshot(
             )));
         }
         Err(e) => {
-            client.disconnect("ring snapshot error").await;
+            graceful_disconnect(client, "ring snapshot error").await;
             return Err(Error::ConnectivityFailed(format!(
                 "Diagnostics query failed for {}: {}",
                 peer.id(),
@@ -1095,7 +1107,7 @@ async fn query_ring_snapshot(
         }
     });
 
-    client.disconnect("ring snapshot complete").await;
+    graceful_disconnect(client, "ring snapshot complete").await;
 
     Ok(RingPeerSnapshot {
         id: node_info.peer_id,
