@@ -838,44 +838,25 @@ fn generate_keypair(
     private_key_path: &std::path::Path,
     public_key_path: &std::path::Path,
 ) -> Result<()> {
-    // Generate private key
-    let output = Command::new("openssl")
-        .args([
-            "genpkey",
-            "-algorithm",
-            "RSA",
-            "-out",
-            private_key_path.to_str().unwrap(),
-            "-pkeyopt",
-            "rsa_keygen_bits:2048",
-        ])
-        .output()?;
+    use rand::RngCore;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
-    if !output.status.success() {
-        return Err(Error::Other(anyhow::anyhow!(
-            "Failed to generate private key: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    // Generate random bytes for the secret key
+    let mut secret_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret_bytes);
 
-    // Extract public key
-    let output = Command::new("openssl")
-        .args([
-            "rsa",
-            "-pubout",
-            "-in",
-            private_key_path.to_str().unwrap(),
-            "-out",
-            public_key_path.to_str().unwrap(),
-        ])
-        .output()?;
+    // Create X25519 keypair - derive public key from secret
+    let secret = StaticSecret::from(secret_bytes);
+    let public = PublicKey::from(&secret);
+    drop(secret); // We save the raw bytes, not the StaticSecret
 
-    if !output.status.success() {
-        return Err(Error::Other(anyhow::anyhow!(
-            "Failed to extract public key: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
+    // Save secret key as hex
+    std::fs::write(private_key_path, hex::encode(secret_bytes))
+        .map_err(|e| Error::Other(anyhow::anyhow!("Failed to write private key: {}", e)))?;
+
+    // Save public key as hex
+    std::fs::write(public_key_path, hex::encode(public.as_bytes()))
+        .map_err(|e| Error::Other(anyhow::anyhow!("Failed to write public key: {}", e)))?;
 
     Ok(())
 }
