@@ -28,7 +28,28 @@ impl Default for Backend {
     fn default() -> Self {
         // Check environment variable for default
         if std::env::var("FREENET_TEST_DOCKER_NAT").is_ok() {
-            Backend::DockerNat(DockerNatConfig::default())
+            let mut config = DockerNatConfig::default();
+
+            // Check for network emulation setting
+            if let Ok(emulation) = std::env::var("FREENET_TEST_NETWORK_EMULATION") {
+                config.network_emulation = match emulation.to_lowercase().as_str() {
+                    "lan" => Some(crate::docker::NetworkEmulation::lan()),
+                    "regional" => Some(crate::docker::NetworkEmulation::regional()),
+                    "intercontinental" => Some(crate::docker::NetworkEmulation::intercontinental()),
+                    "high_latency" => Some(crate::docker::NetworkEmulation::high_latency()),
+                    "challenging" => Some(crate::docker::NetworkEmulation::challenging()),
+                    other => {
+                        tracing::warn!(
+                            "Unknown FREENET_TEST_NETWORK_EMULATION value '{}', ignoring. \
+                             Valid options: lan, regional, intercontinental, high_latency, challenging",
+                            other
+                        );
+                        None
+                    }
+                };
+            }
+
+            Backend::DockerNat(config)
         } else {
             Backend::Local
         }
