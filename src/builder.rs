@@ -427,9 +427,6 @@ impl NetworkBuilder {
             "--public-network-port".to_string(),
             network_port.to_string(),
             "--skip-load-from-network".to_string(),
-            // Disable telemetry to avoid flooding the collector with test data
-            "--telemetry-enabled".to_string(),
-            "false".to_string(),
         ];
 
         if is_gateway {
@@ -480,6 +477,7 @@ impl NetworkBuilder {
         }
 
         // Environment variables
+        // Disable telemetry to avoid flooding the collector with test data
         let env_vars = vec![
             ("NETWORK_ADDRESS".to_string(), network_address.clone()),
             (
@@ -487,6 +485,10 @@ impl NetworkBuilder {
                 network_address.clone(),
             ),
             ("PUBLIC_NETWORK_PORT".to_string(), network_port.to_string()),
+            (
+                "FREENET_TELEMETRY_ENABLED".to_string(),
+                "false".to_string(),
+            ),
         ];
 
         if let Some(min_conn) = self.min_connections {
