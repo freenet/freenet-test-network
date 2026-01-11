@@ -142,8 +142,10 @@ pub(crate) fn spawn_local_peer(
     let log_file = std::fs::File::create(&log_path)?;
 
     let mut cmd = Command::new(binary_path);
+    // Inherit RUST_LOG from parent process if set, otherwise default to "info"
+    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
     cmd.args(args)
-        .env("RUST_LOG", "info")
+        .env("RUST_LOG", rust_log)
         .env("RUST_BACKTRACE", "1")
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
