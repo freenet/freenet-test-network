@@ -14,7 +14,9 @@ mod remote;
 
 pub use binary::{BuildProfile, FreenetBinary};
 pub use builder::{Backend, NetworkBuilder};
-pub use docker::{DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology, NatType};
+pub use docker::{
+    DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology, NatType, NetworkEmulation,
+};
 pub use logs::LogEntry;
 pub use network::{
     ring_nodes_from_diagnostics, write_ring_visualization_from_diagnostics,

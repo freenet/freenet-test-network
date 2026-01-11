@@ -39,6 +39,103 @@ pub struct DockerNatConfig {
     pub cleanup_on_drop: bool,
     /// Prefix for container and network names
     pub name_prefix: String,
+    /// Network emulation settings (latency, jitter, packet loss)
+    /// If None, no network emulation is applied
+    pub network_emulation: Option<NetworkEmulation>,
+}
+
+/// Network emulation settings using Linux tc netem.
+///
+/// These settings simulate realistic network conditions like latency and packet loss.
+/// Useful for testing congestion control behavior under real-world conditions.
+///
+/// # Example
+///
+/// ```
+/// use freenet_test_network::docker::NetworkEmulation;
+///
+/// // Simulate intercontinental latency (100-150ms) with 1% packet loss
+/// let emulation = NetworkEmulation {
+///     delay_ms: 125,
+///     jitter_ms: 25,
+///     loss_percent: 1.0,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Debug, Clone)]
+pub struct NetworkEmulation {
+    /// Base latency in milliseconds
+    pub delay_ms: u32,
+    /// Latency jitter (+/- this value) in milliseconds
+    pub jitter_ms: u32,
+    /// Packet loss percentage (0.0 - 100.0)
+    pub loss_percent: f64,
+    /// Correlation percentage for loss (consecutive losses are correlated)
+    pub loss_correlation: f64,
+}
+
+impl Default for NetworkEmulation {
+    fn default() -> Self {
+        Self {
+            delay_ms: 0,
+            jitter_ms: 0,
+            loss_percent: 0.0,
+            loss_correlation: 25.0, // 25% correlation is typical
+        }
+    }
+}
+
+impl NetworkEmulation {
+    /// Create settings for LAN-like conditions (minimal latency)
+    pub fn lan() -> Self {
+        Self {
+            delay_ms: 1,
+            jitter_ms: 1,
+            loss_percent: 0.0,
+            ..Default::default()
+        }
+    }
+
+    /// Create settings for regional network (US coast-to-coast)
+    pub fn regional() -> Self {
+        Self {
+            delay_ms: 40,
+            jitter_ms: 10,
+            loss_percent: 0.1,
+            ..Default::default()
+        }
+    }
+
+    /// Create settings for intercontinental network (US to Europe)
+    pub fn intercontinental() -> Self {
+        Self {
+            delay_ms: 125,
+            jitter_ms: 25,
+            loss_percent: 0.5,
+            ..Default::default()
+        }
+    }
+
+    /// Create settings for high-latency network (US to Asia-Pacific)
+    /// This is the scenario that triggered the BBR timeout storm bug.
+    pub fn high_latency() -> Self {
+        Self {
+            delay_ms: 200,
+            jitter_ms: 30,
+            loss_percent: 1.0,
+            ..Default::default()
+        }
+    }
+
+    /// Create settings for challenging network conditions
+    pub fn challenging() -> Self {
+        Self {
+            delay_ms: 150,
+            jitter_ms: 50,
+            loss_percent: 3.0,
+            loss_correlation: 50.0,
+        }
+    }
 }
 
 impl Default for DockerNatConfig {
@@ -66,6 +163,7 @@ impl Default for DockerNatConfig {
             private_subnet_base: Ipv4Addr::new(10, private_first_octet, 0, 0),
             cleanup_on_drop: true,
             name_prefix,
+            network_emulation: None,
         }
     }
 }
@@ -941,6 +1039,10 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start gateway: {}", e)))?;
 
+        // Apply network emulation if configured
+        self.apply_network_emulation(&container_id, &container_name)
+            .await?;
+
         // Get the Docker-allocated host port by inspecting the running container
         let host_ws_port = self
             .get_container_host_port(&container_id, ws_port)
@@ -1113,6 +1215,10 @@ WORKDIR /app
             .await
             .map_err(|e| Error::Other(anyhow::anyhow!("Failed to start peer: {}", e)))?;
 
+        // Apply network emulation if configured
+        self.apply_network_emulation(&container_id, &container_name)
+            .await?;
+
         // Get the Docker-allocated host port by inspecting the running container
         let host_ws_port = self
             .get_container_host_port(&container_id, ws_port)
@@ -1257,6 +1363,80 @@ WORKDIR /app
         }
 
         Ok(result)
+    }
+
+    /// Apply network emulation (latency, jitter, packet loss) to a container using tc netem.
+    ///
+    /// This requires NET_ADMIN capability and iproute2 installed in the container.
+    /// The emulation is applied to the eth0 interface (primary network interface).
+    async fn apply_network_emulation(&self, container_id: &str, container_name: &str) -> Result<()> {
+        let Some(ref emulation) = self.config.network_emulation else {
+            return Ok(());
+        };
+
+        // Skip if no emulation configured
+        if emulation.delay_ms == 0 && emulation.loss_percent == 0.0 {
+            return Ok(());
+        }
+
+        // Build tc netem command
+        // tc qdisc add dev eth0 root netem delay 100ms 20ms loss 1% 25%
+        let mut tc_args = vec!["tc", "qdisc", "add", "dev", "eth0", "root", "netem"];
+
+        let delay_str;
+        let jitter_str;
+        let loss_str;
+        let correlation_str;
+
+        // Add delay if configured
+        if emulation.delay_ms > 0 {
+            delay_str = format!("{}ms", emulation.delay_ms);
+            tc_args.push("delay");
+            tc_args.push(&delay_str);
+
+            if emulation.jitter_ms > 0 {
+                jitter_str = format!("{}ms", emulation.jitter_ms);
+                tc_args.push(&jitter_str);
+            }
+        }
+
+        // Add packet loss if configured
+        if emulation.loss_percent > 0.0 {
+            loss_str = format!("{:.2}%", emulation.loss_percent);
+            tc_args.push("loss");
+            tc_args.push(&loss_str);
+
+            if emulation.loss_correlation > 0.0 {
+                correlation_str = format!("{:.0}%", emulation.loss_correlation);
+                tc_args.push(&correlation_str);
+            }
+        }
+
+        tracing::info!(
+            "Applying network emulation to {}: delay={}ms±{}ms, loss={:.2}%",
+            container_name,
+            emulation.delay_ms,
+            emulation.jitter_ms,
+            emulation.loss_percent
+        );
+
+        let output = self.exec_in_container(container_id, &tc_args).await?;
+
+        if !output.is_empty() && output.contains("Error") {
+            tracing::warn!(
+                "Network emulation may have failed for {}: {}",
+                container_name,
+                output.trim()
+            );
+        } else {
+            tracing::debug!(
+                "Network emulation applied to {}: {:?}",
+                container_name,
+                tc_args
+            );
+        }
+
+        Ok(())
     }
 
     /// Clean up all Docker resources created by this backend
