@@ -157,13 +157,35 @@ impl Default for DockerNatConfig {
         // Using 10.x.0.0 range with random first octet portion
         let private_first_octet = rand::thread_rng().gen_range(1..=250);
 
+        // Check for network emulation environment variable
+        let network_emulation =
+            if let Ok(emulation) = std::env::var("FREENET_TEST_NETWORK_EMULATION") {
+                match emulation.to_lowercase().as_str() {
+                    "lan" => Some(NetworkEmulation::lan()),
+                    "regional" => Some(NetworkEmulation::regional()),
+                    "intercontinental" => Some(NetworkEmulation::intercontinental()),
+                    "high_latency" => Some(NetworkEmulation::high_latency()),
+                    "challenging" => Some(NetworkEmulation::challenging()),
+                    other => {
+                        tracing::warn!(
+                            "Unknown FREENET_TEST_NETWORK_EMULATION value '{}', ignoring. \
+                             Valid options: lan, regional, intercontinental, high_latency, challenging",
+                            other
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         Self {
             topology: NatTopology::OnePerNat,
             public_subnet,
             private_subnet_base: Ipv4Addr::new(10, private_first_octet, 0, 0),
             cleanup_on_drop: true,
             name_prefix,
-            network_emulation: None,
+            network_emulation,
         }
     }
 }
