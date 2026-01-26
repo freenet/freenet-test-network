@@ -766,9 +766,8 @@ impl NetworkBuilder {
 fn resolve_base_dir() -> PathBuf {
     if let Some(path) = std::env::var_os("FREENET_TEST_NETWORK_BASE_DIR") {
         PathBuf::from(path)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join("code/tmp/freenet-test-networks")
     } else {
+        // Use system temp directory by default - works on all platforms including CI
         std::env::temp_dir().join("freenet-test-networks")
     }
 }
