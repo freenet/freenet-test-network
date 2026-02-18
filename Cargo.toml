@@ -1,6 +1,6 @@
 [package]
 name = "freenet-test-network"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 license = "LGPL-3.0-only"
 description = "Reliable test network infrastructure for Freenet"
@@ -10,7 +10,7 @@ categories = ["development-tools::testing"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.27", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
