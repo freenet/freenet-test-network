@@ -158,26 +158,27 @@ impl Default for DockerNatConfig {
         let private_first_octet = rand::thread_rng().gen_range(1..=250);
 
         // Check for network emulation environment variable
-        let network_emulation =
-            if let Ok(emulation) = std::env::var("FREENET_TEST_NETWORK_EMULATION") {
-                match emulation.to_lowercase().as_str() {
-                    "lan" => Some(NetworkEmulation::lan()),
-                    "regional" => Some(NetworkEmulation::regional()),
-                    "intercontinental" => Some(NetworkEmulation::intercontinental()),
-                    "high_latency" => Some(NetworkEmulation::high_latency()),
-                    "challenging" => Some(NetworkEmulation::challenging()),
-                    other => {
-                        tracing::warn!(
+        let network_emulation = if let Ok(emulation) =
+            std::env::var("FREENET_TEST_NETWORK_EMULATION")
+        {
+            match emulation.to_lowercase().as_str() {
+                "lan" => Some(NetworkEmulation::lan()),
+                "regional" => Some(NetworkEmulation::regional()),
+                "intercontinental" => Some(NetworkEmulation::intercontinental()),
+                "high_latency" => Some(NetworkEmulation::high_latency()),
+                "challenging" => Some(NetworkEmulation::challenging()),
+                other => {
+                    tracing::warn!(
                             "Unknown FREENET_TEST_NETWORK_EMULATION value '{}', ignoring. \
                              Valid options: lan, regional, intercontinental, high_latency, challenging",
                             other
                         );
-                        None
-                    }
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
         Self {
             topology: NatTopology::OnePerNat,
@@ -977,7 +978,10 @@ WORKDIR /app
                 ..Default::default()
             }),
             env: Some(vec![
-                format!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())),
+                format!(
+                    "RUST_LOG={}",
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+                ),
                 "RUST_BACKTRACE=1".to_string(),
             ]),
             cmd: Some(vec![
@@ -1066,9 +1070,7 @@ WORKDIR /app
             .await?;
 
         // Get the Docker-allocated host port by inspecting the running container
-        let host_ws_port = self
-            .get_container_host_port(&container_id, ws_port)
-            .await?;
+        let host_ws_port = self.get_container_host_port(&container_id, ws_port).await?;
 
         let info = DockerPeerInfo {
             container_id: container_id.clone(),
@@ -1146,7 +1148,10 @@ WORKDIR /app
                 ..Default::default()
             }),
             env: Some(vec![
-                format!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())),
+                format!(
+                    "RUST_LOG={}",
+                    std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
+                ),
                 "RUST_BACKTRACE=1".to_string(),
             ]),
             cmd: Some(vec![
@@ -1242,9 +1247,7 @@ WORKDIR /app
             .await?;
 
         // Get the Docker-allocated host port by inspecting the running container
-        let host_ws_port = self
-            .get_container_host_port(&container_id, ws_port)
-            .await?;
+        let host_ws_port = self.get_container_host_port(&container_id, ws_port).await?;
 
         // Configure routing: traffic to public network goes through NAT router
         // Keep default route via bridge for Docker port forwarding (WebSocket access from host)
@@ -1391,7 +1394,11 @@ WORKDIR /app
     ///
     /// This requires NET_ADMIN capability and iproute2 installed in the container.
     /// The emulation is applied to the eth0 interface (primary network interface).
-    async fn apply_network_emulation(&self, container_id: &str, container_name: &str) -> Result<()> {
+    async fn apply_network_emulation(
+        &self,
+        container_id: &str,
+        container_name: &str,
+    ) -> Result<()> {
         let Some(ref emulation) = self.config.network_emulation else {
             return Ok(());
         };
@@ -1513,14 +1520,20 @@ WORKDIR /app
 
                 // Get NAT table with counters
                 output.push_str("=== NAT table ===\n");
-                match self.exec_in_container(router_id, &["iptables", "-t", "nat", "-nvL"]).await {
+                match self
+                    .exec_in_container(router_id, &["iptables", "-t", "nat", "-nvL"])
+                    .await
+                {
                     Ok(s) => output.push_str(&s),
                     Err(e) => output.push_str(&format!("Error: {}\n", e)),
                 }
 
                 // Get FORWARD chain with counters
                 output.push_str("\n=== FORWARD chain ===\n");
-                match self.exec_in_container(router_id, &["iptables", "-nvL", "FORWARD"]).await {
+                match self
+                    .exec_in_container(router_id, &["iptables", "-nvL", "FORWARD"])
+                    .await
+                {
                     Ok(s) => output.push_str(&s),
                     Err(e) => output.push_str(&format!("Error: {}\n", e)),
                 }
@@ -1542,13 +1555,15 @@ WORKDIR /app
         for (&peer_index, peer_info) in &self.peer_containers {
             if let Some(router_id) = &peer_info.nat_router_id {
                 // Install conntrack-tools if needed
-                let _ = self.exec_in_container(
-                    router_id,
-                    &["apk", "add", "--no-cache", "conntrack-tools"]
-                ).await;
+                let _ = self
+                    .exec_in_container(router_id, &["apk", "add", "--no-cache", "conntrack-tools"])
+                    .await;
 
                 // Get conntrack entries for UDP
-                match self.exec_in_container(router_id, &["conntrack", "-L", "-p", "udp"]).await {
+                match self
+                    .exec_in_container(router_id, &["conntrack", "-L", "-p", "udp"])
+                    .await
+                {
                     Ok(s) if s.trim().is_empty() => {
                         results.insert(peer_index, "(no UDP conntrack entries)".to_string());
                     }
@@ -1574,9 +1589,16 @@ WORKDIR /app
         for (&peer_index, peer_info) in &self.peer_containers {
             if peer_info.nat_router_id.is_some() {
                 // Get route table from the peer container
-                match self.exec_in_container(&peer_info.container_id, &["ip", "route"]).await {
-                    Ok(s) => { results.insert(peer_index, s); }
-                    Err(e) => { results.insert(peer_index, format!("Error: {}", e)); }
+                match self
+                    .exec_in_container(&peer_info.container_id, &["ip", "route"])
+                    .await
+                {
+                    Ok(s) => {
+                        results.insert(peer_index, s);
+                    }
+                    Err(e) => {
+                        results.insert(peer_index, format!("Error: {}", e));
+                    }
                 }
             }
         }
@@ -1590,7 +1612,11 @@ WORKDIR /app
     /// auto-allocated when we specified `host_port: None` in the port binding.
     /// This approach avoids TOCTOU race conditions that can occur when pre-allocating
     /// ports with `get_free_port()` and then trying to bind them in Docker.
-    async fn get_container_host_port(&self, container_id: &str, container_port: u16) -> Result<u16> {
+    async fn get_container_host_port(
+        &self,
+        container_id: &str,
+        container_port: u16,
+    ) -> Result<u16> {
         let info = self
             .docker
             .inspect_container(container_id, None)

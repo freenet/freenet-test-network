@@ -587,8 +587,12 @@ impl TestNetwork {
                 let filter_lower = filter.map(|f| f.to_lowercase());
                 let mut count = 0;
 
-                println!("--- Peer Logs {} ---",
-                    filter.map(|f| format!("(filtered: '{}')", f)).unwrap_or_default());
+                println!(
+                    "--- Peer Logs {} ---",
+                    filter
+                        .map(|f| format!("(filtered: '{}')", f))
+                        .unwrap_or_default()
+                );
 
                 for entry in &entries {
                     let matches = filter_lower
@@ -626,8 +630,17 @@ impl TestNetwork {
                 });
 
                 let keywords = [
-                    "hole", "punch", "nat", "traverse", "acceptor", "joiner",
-                    "handshake", "outbound", "inbound", "connect:", "connection",
+                    "hole",
+                    "punch",
+                    "nat",
+                    "traverse",
+                    "acceptor",
+                    "joiner",
+                    "handshake",
+                    "outbound",
+                    "inbound",
+                    "connect:",
+                    "connection",
                 ];
 
                 println!("--- Connection/NAT Logs ---");
@@ -991,8 +1004,7 @@ async fn query_ring_snapshot(
     let diag_config = if let Some(id) = instance_id {
         // Create a ContractKey with placeholder code hash for the diagnostics API.
         // The code hash is not used for contract lookup/filtering, only the instance ID matters.
-        let placeholder_key =
-            ContractKey::from_id_and_code(*id, CodeHash::new([0u8; 32]));
+        let placeholder_key = ContractKey::from_id_and_code(*id, CodeHash::new([0u8; 32]));
         NodeDiagnosticsConfig {
             include_node_info: true,
             include_network_info: true,
@@ -1091,10 +1103,7 @@ async fn query_ring_snapshot(
                 (false, 0, Vec::new())
             };
         // SubscriptionInfo.contract_key is now ContractInstanceId
-        let subscribed_locally = diag
-            .subscriptions
-            .iter()
-            .any(|sub| &sub.contract_key == id);
+        let subscribed_locally = diag.subscriptions.iter().any(|sub| &sub.contract_key == id);
         if stores_contract || subscribed_locally {
             Some(PeerContractStatus {
                 stores_contract,

@@ -20,8 +20,7 @@ use tracing::{error, info, warn};
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "info,freenet_test_network=debug".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info,freenet_test_network=debug".into()),
         )
         .init();
 
@@ -61,7 +60,10 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to start test network")?;
 
-    info!("Network started. Run root: {}", network.run_root().display());
+    info!(
+        "Network started. Run root: {}",
+        network.run_root().display()
+    );
     info!("");
 
     // Print network topology
@@ -82,20 +84,20 @@ async fn main() -> Result<()> {
     // List containers
     info!("=== Docker Containers ===");
     let containers = Command::new("docker")
-        .args(["ps", "--filter", "name=freenet", "--format", "{{.Names}}\t{{.Status}}"])
+        .args([
+            "ps",
+            "--filter",
+            "name=freenet",
+            "--format",
+            "{{.Names}}\t{{.Status}}",
+        ])
         .output()
         .context("Failed to list containers")?;
     info!("{}", String::from_utf8_lossy(&containers.stdout));
 
     // Find NAT router containers
     let router_output = Command::new("docker")
-        .args([
-            "ps",
-            "--filter",
-            "name=router",
-            "--format",
-            "{{.Names}}",
-        ])
+        .args(["ps", "--filter", "name=router", "--format", "{{.Names}}"])
         .output()
         .context("Failed to find NAT routers")?;
     let router_str = String::from_utf8_lossy(&router_output.stdout).to_string();
@@ -122,7 +124,14 @@ async fn main() -> Result<()> {
         // Also show conntrack table
         info!("--- {} conntrack entries ---", router);
         let _ = Command::new("docker")
-            .args(["exec", router, "apk", "add", "--no-cache", "conntrack-tools"])
+            .args([
+                "exec",
+                router,
+                "apk",
+                "add",
+                "--no-cache",
+                "conntrack-tools",
+            ])
             .output();
         let conntrack = Command::new("docker")
             .args(["exec", router, "conntrack", "-L"])
