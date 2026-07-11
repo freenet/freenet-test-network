@@ -356,10 +356,19 @@ impl NetworkBuilder {
         // Determine network address based on location
         let network_address = match &location {
             PeerLocation::Local => {
-                let addr_index = index as u32;
-                let second_octet = ((addr_index / 256) % 254 + 1) as u8;
-                let third_octet = (addr_index % 256) as u8;
-                Ipv4Addr::new(127, second_octet, third_octet, 1).to_string()
+                if cfg!(target_os = "macos") {
+                    // macOS only configures 127.0.0.1 on lo0; any other
+                    // 127.x.y.z needs a manual `sudo ifconfig lo0 alias`, so
+                    // binding 127.1.0.1 fails with "Can't assign requested
+                    // address". Every node already gets unique ports, so one
+                    // shared loopback IP is enough to keep sockets distinct.
+                    Ipv4Addr::LOCALHOST.to_string()
+                } else {
+                    let addr_index = index as u32;
+                    let second_octet = ((addr_index / 256) % 254 + 1) as u8;
+                    let third_octet = (addr_index % 256) as u8;
+                    Ipv4Addr::new(127, second_octet, third_octet, 1).to_string()
+                }
             }
             PeerLocation::Remote(remote) => {
                 // Discover the public IP address of the remote machine
