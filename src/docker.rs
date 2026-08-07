@@ -983,6 +983,13 @@ WORKDIR /app
                     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
                 ),
                 "RUST_BACKTRACE=1".to_string(),
+                // Freenet defaults telemetry-enabled=true and reports to the
+                // production collector (nova.locut.us:4318) unless told
+                // otherwise. Docker NAT test peers are synthetic and must
+                // never phone home to it (see Backend::Local's equivalent
+                // FREENET_TELEMETRY_ENABLED=false in builder.rs, which this
+                // container path was missing).
+                "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
             cmd: Some(vec![
                 "/app/freenet".to_string(),
@@ -1153,6 +1160,13 @@ WORKDIR /app
                     std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())
                 ),
                 "RUST_BACKTRACE=1".to_string(),
+                // Freenet defaults telemetry-enabled=true and reports to the
+                // production collector (nova.locut.us:4318) unless told
+                // otherwise. Docker NAT test peers are synthetic and must
+                // never phone home to it (see Backend::Local's equivalent
+                // FREENET_TELEMETRY_ENABLED=false in builder.rs, which this
+                // container path was missing).
+                "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
             cmd: Some(vec![
                 "/app/freenet".to_string(),
