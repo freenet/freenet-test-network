@@ -27,7 +27,7 @@ bollard = "0.18"
 ipnetwork = "0.20"
 rand = "0.8"
 tar = "0.4"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 hex = "0.4"
 
 [dev-dependencies]
