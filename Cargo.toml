@@ -10,7 +10,7 @@ categories = ["development-tools::testing"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
