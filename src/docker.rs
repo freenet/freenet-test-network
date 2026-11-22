@@ -191,6 +191,15 @@ impl Default for DockerNatConfig {
     }
 }
 
+/// Router rule that silently drops UDP addressed to the router itself on its public
+/// interface. A conntrack-only (restricted) NAT needs it: without it an unsolicited
+/// packet from a peer that has not been punched toward yet reaches the router's own
+/// INPUT chain, which answers ICMP port unreachable and leaves a conntrack entry
+/// whose reply tuple collides with the peer's later outbound mapping, so hole
+/// punching fails. A real NAT drops such packets silently. Packets of flows the peer
+/// opened are forwarded, not delivered locally, so they are not affected.
+const PUBLIC_UDP_INPUT_DROP: &str = "iptables -A INPUT -i $PUBLIC_IF -p udp -j DROP";
+
 /// How peers are distributed across NAT networks
 #[derive(Debug, Clone)]
 pub enum NatTopology {
@@ -673,6 +682,7 @@ impl DockerNatBackend {
             // This breaks UDP hole punching entirely
             format!(
                 "iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp -j MASQUERADE --random && \
+                 {PUBLIC_UDP_INPUT_DROP} && \
                  echo 'Symmetric NAT: Random port mapping enabled (hole punching will fail)' && "
             )
         } else {
@@ -685,17 +695,16 @@ impl DockerNatBackend {
             //    that we've previously sent to (handled by conntrack)
             //
             // Implementation:
-            // - DNAT: Forward incoming UDP/31337 to internal peer (enables hole punching)
             // - SNAT: Preserve port 31337 on outbound (EIM behavior)
-            // - Conntrack handles port-restricted filtering automatically
-            //
-            // Note: Without DNAT, incoming packets to the NAT's public IP are delivered
-            // to the router itself (INPUT chain) rather than forwarded to the internal peer.
+            // - NO DNAT. A DNAT of every inbound UDP/31337 forwards packets from ANY
+            //   source to the peer, which is full-cone filtering, not port-restricted.
+            //   Reply traffic for a flow the peer opened is translated back by conntrack
+            //   alone, so hole punching still works.
+            // - Unsolicited inbound UDP is dropped (see `PUBLIC_UDP_INPUT_DROP`).
             format!(
                 "echo 'Port-Restricted Cone NAT: EIM + port-restricted filtering' && \
-                 iptables -t nat -A PREROUTING -i $PUBLIC_IF -p udp --dport 31337 -j DNAT --to-destination {}:31337 && \
-                 iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp --sport 31337 -j SNAT --to-source $PUBLIC_IP:31337 && ",
-                peer_private_ip
+                 {PUBLIC_UDP_INPUT_DROP} && \
+                 iptables -t nat -A POSTROUTING -o $PUBLIC_IF -p udp --sport 31337 -j SNAT --to-source $PUBLIC_IP:31337 && "
             )
         };
 

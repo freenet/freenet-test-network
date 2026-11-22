@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
 
     gateway_client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: contract_key.clone().into(),
             return_contract_code: false,
             subscribe: false,
         }))
@@ -251,7 +251,7 @@ async fn main() -> Result<()> {
     info!("Step 3: Verify GET from peer (self-retrieval)...");
     peer_client
         .send(ClientRequest::ContractOp(ContractRequest::Get {
-            key: contract_key.clone(),
+            key: contract_key.clone().into(),
             return_contract_code: false,
             subscribe: false,
         }))
