@@ -669,6 +669,9 @@ impl DockerNatBackend {
         // The key insight: Linux conntrack already provides port-restricted cone behavior
         // by default with MASQUERADE - it allows return traffic from the exact IP:port
         // that received outbound traffic. We just need to NOT add blanket DNAT rules.
+        // Both the default and the symmetric mode also add an INPUT DROP for UDP on the
+        // public interface, so unsolicited packets die silently instead of drawing an
+        // ICMP port unreachable from the router and leaving a colliding conntrack entry.
         let dnat_rules = if std::env::var("FREENET_TEST_FULL_CONE_NAT").is_ok() {
             // Full Cone NAT: Add DNAT rules to forward all traffic on port 31337 to peer
             // This simulates port forwarding / UPnP - unrealistic for testing hole punching
