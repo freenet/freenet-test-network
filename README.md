@@ -178,6 +178,9 @@ Notes:
 - The default binary is resolved only if some node uses it, so a network where
   every node is overridden never builds it.
 
+`examples/per_node_check.rs` is a manual end-to-end check of these options
+(needs Docker and a `freenet` on PATH): `cargo run --example per_node_check`.
+
 ## Remote Peer Support (SSH)
 
 **New in v0.2**: Spawn peers on remote Linux machines via SSH for realistic NAT/firewall testing.
