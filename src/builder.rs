@@ -145,7 +145,12 @@ impl NetworkBuilder {
     /// Use a different binary for one gateway (`index` counts gateways from 0).
     ///
     /// Nodes without an override use the binary set with [`binary`](Self::binary).
-    /// Useful for mixed-version tests.
+    /// Useful for mixed-version tests. Prefer [`FreenetBinary::Path`]: the other
+    /// variants build or look up a binary once per node that uses them. Not
+    /// supported on remote (SSH) nodes; `build()` returns an error for that.
+    ///
+    /// Container names use the combined index (gateways first), while the
+    /// `*_binary`, `*_extra_args` and `*_extra_hosts` indices count within a role.
     pub fn gateway_binary(mut self, index: usize, binary: FreenetBinary) -> Self {
         self.overrides_mut(NodeKey::Gateway(index)).binary = Some(binary);
         self
@@ -159,6 +164,10 @@ impl NetworkBuilder {
     }
 
     /// Append extra CLI arguments to one gateway's `freenet network` command line.
+    ///
+    /// Do not repeat a flag the harness already sets (for example
+    /// `--min-number-of-connections`, `--ws-api-port`, `--is-gateway`): the
+    /// node fails at startup on a duplicate.
     pub fn gateway_extra_args<I, S>(mut self, index: usize, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -250,6 +259,25 @@ impl NetworkBuilder {
         args
     }
 
+    /// Extra CLI args for the node at combined index `global_index` (gateways
+    /// first, then regular peers), as the local backend numbers nodes.
+    fn args_for_node(&self, global_index: usize, is_gateway: bool) -> Vec<String> {
+        let role_index = if is_gateway {
+            global_index
+        } else {
+            global_index - self.gateways
+        };
+        self.extra_args_for(Self::node_key(is_gateway, role_index))
+    }
+
+    /// Where the node at combined index `global_index` runs.
+    fn location_for(&self, global_index: usize) -> PeerLocation {
+        self.peer_locations
+            .get(&global_index)
+            .cloned()
+            .unwrap_or_else(|| self.default_location.clone())
+    }
+
     /// Extra `/etc/hosts` entries for a node: the all-node entries, then the node's own.
     fn extra_hosts_for(&self, key: NodeKey) -> Vec<String> {
         let mut hosts = self.all_extra_hosts.clone();
@@ -281,13 +309,39 @@ impl NetworkBuilder {
                 )));
             }
         }
+        // Remote deployment uploads each binary to `bin/<file name>` and
+        // `RemoteMachine::freenet_binary` replaces every binary, so per-node
+        // binaries cannot work there.
+        for (key, o) in &self.node_overrides {
+            if o.binary.is_none() {
+                continue;
+            }
+            let global = match *key {
+                NodeKey::Gateway(i) => i,
+                NodeKey::Peer(i) => self.gateways + i,
+            };
+            if let PeerLocation::Remote(remote) = self.location_for(global) {
+                let why = if remote.freenet_binary.is_some() {
+                    "it conflicts with RemoteMachine::freenet_binary"
+                } else {
+                    "remote nodes do not support per-node binaries"
+                };
+                return Err(Error::PeerStartupFailed(format!(
+                    "per-node binary override for {key:?} is on a remote node: {why}"
+                )));
+            }
+        }
         let all_hosts = self
             .all_extra_hosts
             .iter()
             .chain(self.node_overrides.values().flat_map(|o| &o.extra_hosts));
         for host in all_hosts {
+            // `host:ip`; the value may be IPv6 or `host-gateway`, so split on the first colon.
             match host.split_once(':') {
-                Some((name, ip)) if !name.is_empty() && !ip.is_empty() => {}
+                Some((name, ip))
+                    if !name.is_empty()
+                        && !ip.is_empty()
+                        && !host.chars().any(char::is_whitespace) => {}
                 _ => {
                     return Err(Error::PeerStartupFailed(format!(
                         "invalid extra host entry {host:?}, expected \"host:ip\""
@@ -731,12 +785,7 @@ impl NetworkBuilder {
             args.push(max_conn.to_string());
         }
 
-        let role_index = if is_gateway {
-            index
-        } else {
-            index - self.gateways
-        };
-        args.extend(self.extra_args_for(Self::node_key(is_gateway, role_index)));
+        args.extend(self.args_for_node(index, is_gateway));
 
         // Spawn process (local or remote)
         let process: Box<dyn PeerProcess + Send> = match &location {
@@ -1218,6 +1267,53 @@ mod tests {
     }
 
     #[test]
+    fn args_for_node_maps_combined_index_to_role_index() {
+        let b = NetworkBuilder::new()
+            .gateways(2)
+            .peers(2)
+            .gateway_extra_args(1, ["--gw1"])
+            .peer_extra_args(0, ["--peer0"])
+            .peer_extra_args(1, ["--peer1"]);
+        // Combined indices: 0,1 are gateways; 2,3 are peers 0,1.
+        assert!(b.args_for_node(0, true).is_empty());
+        assert_eq!(b.args_for_node(1, true), ["--gw1"]);
+        assert_eq!(b.args_for_node(2, false), ["--peer0"]);
+        assert_eq!(b.args_for_node(3, false), ["--peer1"]);
+    }
+
+    #[test]
+    fn per_node_binary_on_remote_is_rejected() {
+        let remote = RemoteMachine::new("example.invalid");
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(2)
+            .peer_location(2, PeerLocation::Remote(remote.clone()))
+            .peer_binary(1, FreenetBinary::Installed);
+        let err = b.validate_overrides().unwrap_err().to_string();
+        assert!(err.contains("remote"), "{err}");
+
+        // Same override on a local node is fine.
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(2)
+            .peer_location(2, PeerLocation::Remote(remote))
+            .peer_binary(0, FreenetBinary::Installed);
+        assert!(b.validate_overrides().is_ok());
+    }
+
+    #[test]
+    fn per_node_binary_conflicting_with_remote_freenet_binary_is_rejected() {
+        let remote = RemoteMachine::new("example.invalid").freenet_binary("/usr/bin/freenet");
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(1)
+            .default_location(PeerLocation::Remote(remote))
+            .gateway_binary(0, FreenetBinary::Installed);
+        let err = b.validate_overrides().unwrap_err().to_string();
+        assert!(err.contains("freenet_binary"), "{err}");
+    }
+
+    #[test]
     fn repeated_per_node_calls_accumulate() {
         let b = NetworkBuilder::new()
             .gateway_extra_args(0, ["--a"])
@@ -1259,18 +1355,36 @@ mod tests {
 
     #[test]
     fn malformed_host_entry_is_rejected() {
-        for bad in ["github.com", ":127.0.0.1", "github.com:"] {
+        for bad in [
+            "github.com",
+            ":127.0.0.1",
+            "github.com:",
+            "github.com: 127.0.0.1",
+            " github.com:127.0.0.1",
+            "github.com:127.0.0.1 ",
+            "a b:127.0.0.1",
+        ] {
             let res = NetworkBuilder::new()
                 .gateways(1)
                 .gateway_extra_hosts(0, [bad])
                 .validate_overrides();
             assert!(res.is_err(), "{bad:?} should be rejected");
         }
-        assert!(NetworkBuilder::new()
-            .gateways(1)
-            .gateway_extra_hosts(0, ["github.com:127.0.0.1"])
-            .validate_overrides()
-            .is_ok());
+        for good in [
+            "github.com:127.0.0.1",
+            "github.com:::1",
+            "github.com:2001:db8::1",
+            "github.com:host-gateway",
+        ] {
+            assert!(
+                NetworkBuilder::new()
+                    .gateways(1)
+                    .gateway_extra_hosts(0, [good])
+                    .validate_overrides()
+                    .is_ok(),
+                "{good:?} should be accepted"
+            );
+        }
     }
 
     #[test]

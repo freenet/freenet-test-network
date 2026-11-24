@@ -261,6 +261,90 @@ impl ContainerOptions {
     }
 }
 
+/// Command line for a gateway container: the harness arguments, then the
+/// node's extra arguments.
+fn gateway_cmd(
+    ws_port: u16,
+    network_port: u16,
+    public_ip: Ipv4Addr,
+    options: &ContainerOptions,
+) -> Vec<String> {
+    let mut cmd: Vec<String> = [
+        "/app/freenet",
+        "network",
+        "--data-dir",
+        "/data",
+        "--config-dir",
+        "/config",
+        "--ws-api-address",
+        "0.0.0.0",
+        "--ws-api-port",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    cmd.push(ws_port.to_string());
+    cmd.push("--network-address".to_string());
+    cmd.push("0.0.0.0".to_string());
+    cmd.push("--network-port".to_string());
+    cmd.push(network_port.to_string());
+    cmd.push("--public-network-address".to_string());
+    cmd.push(public_ip.to_string());
+    cmd.push("--public-network-port".to_string());
+    cmd.push(network_port.to_string());
+    cmd.push("--is-gateway".to_string());
+    cmd.push("--skip-load-from-network".to_string());
+    cmd.push("--transport-keypair".to_string());
+    cmd.push("/config/keypair.pem".to_string());
+    cmd.extend(options.extra_args.iter().cloned());
+    cmd
+}
+
+/// Command line for a peer container: the harness arguments, then the
+/// node's extra arguments. The peer discovers its public address via the gateway.
+fn peer_cmd(ws_port: u16, network_port: u16, options: &ContainerOptions) -> Vec<String> {
+    let mut cmd: Vec<String> = [
+        "/app/freenet",
+        "network",
+        "--data-dir",
+        "/data",
+        "--config-dir",
+        "/config",
+        "--ws-api-address",
+        "0.0.0.0",
+        "--ws-api-port",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    cmd.push(ws_port.to_string());
+    cmd.push("--network-address".to_string());
+    cmd.push("0.0.0.0".to_string());
+    cmd.push("--network-port".to_string());
+    cmd.push(network_port.to_string());
+    cmd.push("--skip-load-from-network".to_string());
+    cmd.push("--transport-keypair".to_string());
+    cmd.push("/config/keypair.pem".to_string());
+    cmd.extend(options.extra_args.iter().cloned());
+    cmd
+}
+
+/// Docker host config shared by gateway and peer containers.
+fn container_host_config(ws_port: u16, options: &ContainerOptions) -> HostConfig {
+    HostConfig {
+        port_bindings: Some(HashMap::from([(
+            format!("{}/tcp", ws_port),
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: None, // Let Docker auto-allocate to avoid port conflicts
+            }]),
+        )])),
+        cap_add: Some(vec!["NET_ADMIN".to_string()]),
+        extra_hosts: options.host_config_extra_hosts(),
+        ..Default::default()
+    }
+}
+
 /// Information about a peer running in a Docker container
 #[derive(Debug, Clone)]
 pub struct DockerPeerInfo {
@@ -1026,18 +1110,7 @@ WORKDIR /app
                 format!("{}/tcp", ws_port),
                 HashMap::new(),
             )])),
-            host_config: Some(HostConfig {
-                port_bindings: Some(HashMap::from([(
-                    format!("{}/tcp", ws_port),
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: None, // Let Docker auto-allocate to avoid port conflicts
-                    }]),
-                )])),
-                cap_add: Some(vec!["NET_ADMIN".to_string()]),
-                extra_hosts: options.host_config_extra_hosts(),
-                ..Default::default()
-            }),
+            host_config: Some(container_host_config(ws_port, options)),
             env: Some(vec![
                 format!(
                     "RUST_LOG={}",
@@ -1052,35 +1125,7 @@ WORKDIR /app
                 // container path was missing).
                 "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
-            cmd: Some(
-                vec![
-                    "/app/freenet".to_string(),
-                    "network".to_string(),
-                    "--data-dir".to_string(),
-                    "/data".to_string(),
-                    "--config-dir".to_string(),
-                    "/config".to_string(),
-                    "--ws-api-address".to_string(),
-                    "0.0.0.0".to_string(),
-                    "--ws-api-port".to_string(),
-                    ws_port.to_string(),
-                    "--network-address".to_string(),
-                    "0.0.0.0".to_string(),
-                    "--network-port".to_string(),
-                    network_port.to_string(),
-                    "--public-network-address".to_string(),
-                    gateway_ip.to_string(),
-                    "--public-network-port".to_string(),
-                    network_port.to_string(),
-                    "--is-gateway".to_string(),
-                    "--skip-load-from-network".to_string(),
-                    "--transport-keypair".to_string(),
-                    "/config/keypair.pem".to_string(),
-                ]
-                .into_iter()
-                .chain(options.extra_args.iter().cloned())
-                .collect(),
-            ),
+            cmd: Some(gateway_cmd(ws_port, network_port, gateway_ip, options)),
             ..Default::default()
         };
 
@@ -1241,18 +1286,7 @@ WORKDIR /app
                 format!("{}/tcp", ws_port),
                 HashMap::new(),
             )])),
-            host_config: Some(HostConfig {
-                port_bindings: Some(HashMap::from([(
-                    format!("{}/tcp", ws_port),
-                    Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".to_string()),
-                        host_port: None, // Let Docker auto-allocate to avoid port conflicts
-                    }]),
-                )])),
-                cap_add: Some(vec!["NET_ADMIN".to_string()]),
-                extra_hosts: options.host_config_extra_hosts(),
-                ..Default::default()
-            }),
+            host_config: Some(container_host_config(ws_port, options)),
             env: Some(vec![
                 format!(
                     "RUST_LOG={}",
@@ -1267,31 +1301,7 @@ WORKDIR /app
                 // container path was missing).
                 "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
-            cmd: Some(
-                vec![
-                    "/app/freenet".to_string(),
-                    "network".to_string(),
-                    "--data-dir".to_string(),
-                    "/data".to_string(),
-                    "--config-dir".to_string(),
-                    "/config".to_string(),
-                    "--ws-api-address".to_string(),
-                    "0.0.0.0".to_string(),
-                    "--ws-api-port".to_string(),
-                    ws_port.to_string(),
-                    "--network-address".to_string(),
-                    "0.0.0.0".to_string(),
-                    "--network-port".to_string(),
-                    network_port.to_string(),
-                    // Don't set public address - let Freenet discover it via gateway
-                    "--skip-load-from-network".to_string(),
-                    "--transport-keypair".to_string(),
-                    "/config/keypair.pem".to_string(),
-                ]
-                .into_iter()
-                .chain(options.extra_args.iter().cloned())
-                .collect(),
-            ),
+            cmd: Some(peer_cmd(ws_port, network_port, options)),
             ..Default::default()
         };
 
@@ -1837,7 +1847,56 @@ impl Drop for DockerNatBackend {
 
 #[cfg(test)]
 mod container_options_tests {
-    use super::ContainerOptions;
+    use super::*;
+
+    fn opts(args: &[&str], hosts: &[&str]) -> ContainerOptions {
+        ContainerOptions {
+            extra_args: args.iter().map(|s| s.to_string()).collect(),
+            extra_hosts: hosts.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn gateway_cmd_appends_extra_args_last() {
+        let cmd = gateway_cmd(
+            9000,
+            31337,
+            Ipv4Addr::new(172, 20, 0, 10),
+            &opts(&["--x", "1"], &[]),
+        );
+        assert!(cmd.contains(&"--is-gateway".to_string()));
+        assert_eq!(&cmd[cmd.len() - 2..], ["--x", "1"]);
+    }
+
+    #[test]
+    fn peer_cmd_appends_extra_args_last() {
+        let cmd = peer_cmd(9000, 31337, &opts(&["--y"], &[]));
+        assert!(!cmd.contains(&"--is-gateway".to_string()));
+        assert_eq!(cmd.last().map(String::as_str), Some("--y"));
+    }
+
+    #[test]
+    fn cmds_unchanged_without_options() {
+        let gw = gateway_cmd(9000, 31337, Ipv4Addr::new(172, 20, 0, 10), &opts(&[], &[]));
+        assert_eq!(gw.last().map(String::as_str), Some("/config/keypair.pem"));
+        let peer = peer_cmd(9000, 31337, &opts(&[], &[]));
+        assert_eq!(peer.last().map(String::as_str), Some("/config/keypair.pem"));
+    }
+
+    #[test]
+    fn host_config_carries_extra_hosts_and_ports() {
+        let hc = container_host_config(9000, &opts(&[], &["github.com:127.0.0.1"]));
+        assert_eq!(
+            hc.extra_hosts,
+            Some(vec!["github.com:127.0.0.1".to_string()])
+        );
+        assert!(hc.port_bindings.unwrap().contains_key("9000/tcp"));
+        assert_eq!(hc.cap_add, Some(vec!["NET_ADMIN".to_string()]));
+        assert_eq!(
+            container_host_config(9000, &opts(&[], &[])).extra_hosts,
+            None
+        );
+    }
 
     #[test]
     fn extra_hosts_none_when_empty() {

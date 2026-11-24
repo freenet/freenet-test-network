@@ -168,18 +168,34 @@ let network = NetworkBuilder::new()
 Notes:
 
 - Indices count within the role: `peer_binary(0, ..)` is the first regular peer,
-  not the first node. (`peer_location` still uses the combined index.)
-- Host entries use Docker's `host:ip` form and are Docker NAT only; a
-  local-process network refuses them at build time.
-- Extra arguments are appended after the harness arguments, so a repeated flag
-  is parsed by the node's own CLI rules.
+  not the first node. (`peer_location` still uses the combined index.) Docker
+  container names also use the combined index: with one gateway, regular peer 0
+  is the container `<prefix>-peer-1`.
+- Host entries use Docker's `host:ip` form (the value may be an IPv6 address or
+  `host-gateway`) and are Docker NAT only; a local-process network refuses them
+  at build time. Whitespace and empty parts are rejected.
+- Extra arguments are appended after the harness arguments. Do not repeat a
+  flag the harness already sets (`--min-number-of-connections` when you also
+  call `min_connections`, `--ws-api-port`, `--is-gateway`, and so on): the node
+  rejects the duplicate and fails at startup.
+- Use `FreenetBinary::Path` for per-node overrides. The other variants build or
+  look up a binary once per node that uses them.
+- Per-node binaries are not supported on remote (SSH) peers, because remote
+  deployment stores every binary under `bin/<file name>` and
+  `RemoteMachine::freenet_binary` replaces all of them. `build()` returns an
+  error for that combination.
 - Overrides for a node that does not exist, or a malformed host entry, fail
   `build()` instead of being ignored.
 - The default binary is resolved only if some node uses it, so a network where
   every node is overridden never builds it.
 
-`examples/per_node_check.rs` is a manual end-to-end check of these options
-(needs Docker and a `freenet` on PATH): `cargo run --example per_node_check`.
+`examples/per_node_check.rs` is a manual end-to-end check of these options.
+It needs Docker, a `freenet` on PATH (the gateway) and a second, different
+binary in `FREENET_OLD_BINARY` (the peer):
+`FREENET_OLD_BINARY=/path/to/older/freenet cargo run --example per_node_check`.
+It confirms from inside the containers which binary each one runs, the host
+entry, and the extra argument. Its command-line check reads
+`/proc/1/cmdline`, so it assumes the node is PID 1 (no entrypoint wrapper).
 
 ## Remote Peer Support (SSH)
 
