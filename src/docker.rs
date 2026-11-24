@@ -241,6 +241,26 @@ pub struct DockerNatBackend {
     public_network_id: Option<String>,
 }
 
+/// Per-container additions to the default Docker node configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerOptions {
+    /// CLI arguments appended after the harness-generated `freenet network` arguments.
+    pub extra_args: Vec<String>,
+    /// `/etc/hosts` entries in Docker's `host:ip` form.
+    pub extra_hosts: Vec<String>,
+}
+
+impl ContainerOptions {
+    /// Value for `HostConfig::extra_hosts`; `None` when there are no entries.
+    fn host_config_extra_hosts(&self) -> Option<Vec<String>> {
+        if self.extra_hosts.is_empty() {
+            None
+        } else {
+            Some(self.extra_hosts.clone())
+        }
+    }
+}
+
 /// Information about a peer running in a Docker container
 #[derive(Debug, Clone)]
 pub struct DockerPeerInfo {
@@ -944,6 +964,7 @@ WORKDIR /app
     }
 
     /// Create a gateway container (on public network, no NAT)
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_gateway(
         &mut self,
         index: usize,
@@ -953,6 +974,33 @@ WORKDIR /app
         ws_port: u16,
         network_port: u16,
         run_root: &Path,
+    ) -> Result<(DockerPeerInfo, DockerProcess)> {
+        self.create_gateway_with_options(
+            index,
+            binary_path,
+            keypair_path,
+            public_key_path,
+            ws_port,
+            network_port,
+            run_root,
+            &ContainerOptions::default(),
+        )
+        .await
+    }
+
+    /// Like [`create_gateway`](Self::create_gateway), with per-container extra
+    /// CLI arguments and `/etc/hosts` entries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_gateway_with_options(
+        &mut self,
+        index: usize,
+        binary_path: &Path,
+        keypair_path: &Path,
+        public_key_path: &Path,
+        ws_port: u16,
+        network_port: u16,
+        run_root: &Path,
+        options: &ContainerOptions,
     ) -> Result<(DockerPeerInfo, DockerProcess)> {
         let container_name = format!("{}-gw-{}", self.config.name_prefix, index);
         let image = self.ensure_base_image().await?;
@@ -987,6 +1035,7 @@ WORKDIR /app
                     }]),
                 )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
+                extra_hosts: options.host_config_extra_hosts(),
                 ..Default::default()
             }),
             env: Some(vec![
@@ -1003,30 +1052,35 @@ WORKDIR /app
                 // container path was missing).
                 "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
-            cmd: Some(vec![
-                "/app/freenet".to_string(),
-                "network".to_string(),
-                "--data-dir".to_string(),
-                "/data".to_string(),
-                "--config-dir".to_string(),
-                "/config".to_string(),
-                "--ws-api-address".to_string(),
-                "0.0.0.0".to_string(),
-                "--ws-api-port".to_string(),
-                ws_port.to_string(),
-                "--network-address".to_string(),
-                "0.0.0.0".to_string(),
-                "--network-port".to_string(),
-                network_port.to_string(),
-                "--public-network-address".to_string(),
-                gateway_ip.to_string(),
-                "--public-network-port".to_string(),
-                network_port.to_string(),
-                "--is-gateway".to_string(),
-                "--skip-load-from-network".to_string(),
-                "--transport-keypair".to_string(),
-                "/config/keypair.pem".to_string(),
-            ]),
+            cmd: Some(
+                vec![
+                    "/app/freenet".to_string(),
+                    "network".to_string(),
+                    "--data-dir".to_string(),
+                    "/data".to_string(),
+                    "--config-dir".to_string(),
+                    "/config".to_string(),
+                    "--ws-api-address".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--ws-api-port".to_string(),
+                    ws_port.to_string(),
+                    "--network-address".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--network-port".to_string(),
+                    network_port.to_string(),
+                    "--public-network-address".to_string(),
+                    gateway_ip.to_string(),
+                    "--public-network-port".to_string(),
+                    network_port.to_string(),
+                    "--is-gateway".to_string(),
+                    "--skip-load-from-network".to_string(),
+                    "--transport-keypair".to_string(),
+                    "/config/keypair.pem".to_string(),
+                ]
+                .into_iter()
+                .chain(options.extra_args.iter().cloned())
+                .collect(),
+            ),
             ..Default::default()
         };
 
@@ -1125,6 +1179,7 @@ WORKDIR /app
     }
 
     /// Create a peer container behind NAT
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_peer(
         &mut self,
         index: usize,
@@ -1136,6 +1191,37 @@ WORKDIR /app
         ws_port: u16,
         network_port: u16,
         run_root: &Path,
+    ) -> Result<(DockerPeerInfo, DockerProcess)> {
+        self.create_peer_with_options(
+            index,
+            binary_path,
+            keypair_path,
+            public_key_path,
+            gateways_toml_path,
+            gateway_public_key_path,
+            ws_port,
+            network_port,
+            run_root,
+            &ContainerOptions::default(),
+        )
+        .await
+    }
+
+    /// Like [`create_peer`](Self::create_peer), with per-container extra CLI
+    /// arguments and `/etc/hosts` entries.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_peer_with_options(
+        &mut self,
+        index: usize,
+        binary_path: &Path,
+        keypair_path: &Path,
+        public_key_path: &Path,
+        gateways_toml_path: &Path,
+        gateway_public_key_path: Option<&Path>,
+        ws_port: u16,
+        network_port: u16,
+        run_root: &Path,
+        options: &ContainerOptions,
     ) -> Result<(DockerPeerInfo, DockerProcess)> {
         let container_name = format!("{}-peer-{}", self.config.name_prefix, index);
         let image = self.ensure_base_image().await?;
@@ -1164,6 +1250,7 @@ WORKDIR /app
                     }]),
                 )])),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
+                extra_hosts: options.host_config_extra_hosts(),
                 ..Default::default()
             }),
             env: Some(vec![
@@ -1180,26 +1267,31 @@ WORKDIR /app
                 // container path was missing).
                 "FREENET_TELEMETRY_ENABLED=false".to_string(),
             ]),
-            cmd: Some(vec![
-                "/app/freenet".to_string(),
-                "network".to_string(),
-                "--data-dir".to_string(),
-                "/data".to_string(),
-                "--config-dir".to_string(),
-                "/config".to_string(),
-                "--ws-api-address".to_string(),
-                "0.0.0.0".to_string(),
-                "--ws-api-port".to_string(),
-                ws_port.to_string(),
-                "--network-address".to_string(),
-                "0.0.0.0".to_string(),
-                "--network-port".to_string(),
-                network_port.to_string(),
-                // Don't set public address - let Freenet discover it via gateway
-                "--skip-load-from-network".to_string(),
-                "--transport-keypair".to_string(),
-                "/config/keypair.pem".to_string(),
-            ]),
+            cmd: Some(
+                vec![
+                    "/app/freenet".to_string(),
+                    "network".to_string(),
+                    "--data-dir".to_string(),
+                    "/data".to_string(),
+                    "--config-dir".to_string(),
+                    "/config".to_string(),
+                    "--ws-api-address".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--ws-api-port".to_string(),
+                    ws_port.to_string(),
+                    "--network-address".to_string(),
+                    "0.0.0.0".to_string(),
+                    "--network-port".to_string(),
+                    network_port.to_string(),
+                    // Don't set public address - let Freenet discover it via gateway
+                    "--skip-load-from-network".to_string(),
+                    "--transport-keypair".to_string(),
+                    "/config/keypair.pem".to_string(),
+                ]
+                .into_iter()
+                .chain(options.extra_args.iter().cloned())
+                .collect(),
+            ),
             ..Default::default()
         };
 
@@ -1740,5 +1832,27 @@ impl Drop for DockerNatBackend {
                 tracing::error!("Failed to create runtime for cleanup");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod container_options_tests {
+    use super::ContainerOptions;
+
+    #[test]
+    fn extra_hosts_none_when_empty() {
+        assert_eq!(ContainerOptions::default().host_config_extra_hosts(), None);
+    }
+
+    #[test]
+    fn extra_hosts_passed_through() {
+        let opts = ContainerOptions {
+            extra_args: vec![],
+            extra_hosts: vec!["github.com:127.0.0.1".into()],
+        };
+        assert_eq!(
+            opts.host_config_extra_hosts(),
+            Some(vec!["github.com:127.0.0.1".to_string()])
+        );
     }
 }

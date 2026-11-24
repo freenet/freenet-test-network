@@ -15,7 +15,8 @@ mod remote;
 pub use binary::{BuildProfile, FreenetBinary};
 pub use builder::{Backend, NetworkBuilder};
 pub use docker::{
-    DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology, NatType, NetworkEmulation,
+    ContainerOptions, DockerNatBackend, DockerNatConfig, DockerPeerInfo, NatTopology, NatType,
+    NetworkEmulation,
 };
 pub use logs::LogEntry;
 pub use network::{

@@ -130,6 +130,54 @@ cargo run --example docker_nat
 PEER_COUNT=4 cargo run --example docker_nat
 ```
 
+## Per-Node Binaries, Arguments and Hosts
+
+By default one binary (set with `.binary(..)`) runs every node. For tests that
+mix versions, individual nodes can override the binary, add command-line
+arguments, and add `/etc/hosts` entries.
+
+```rust
+use freenet_test_network::{Backend, FreenetBinary, NetworkBuilder};
+use std::path::PathBuf;
+
+let network = NetworkBuilder::new()
+    .backend(Backend::DockerNat(Default::default()))
+    .gateways(1)
+    .peers(3)
+    // Default binary for nodes without an override.
+    .binary(FreenetBinary::Path(PathBuf::from("/bin/freenet-new")))
+    // Peer 1 runs an older release.
+    .peer_binary(1, FreenetBinary::Path(PathBuf::from("/bin/freenet-old")))
+    // Keep every node from reaching GitHub, so an older node does not
+    // take the auto-update path and replace the binary under test.
+    .extra_hosts_all(["github.com:127.0.0.1", "api.github.com:127.0.0.1"])
+    // Extra CLI arguments for a single node.
+    .peer_extra_args(2, ["--some-flag", "value"])
+    .build()
+    .await?;
+```
+
+| Method | Effect |
+|---|---|
+| `gateway_binary(i, bin)` / `peer_binary(i, bin)` | Binary for one node |
+| `gateway_extra_args(i, args)` / `peer_extra_args(i, args)` | Arguments appended to that node's `freenet network` command |
+| `extra_args_all(args)` | Arguments appended to every node, before per-node ones |
+| `gateway_extra_hosts(i, hosts)` / `peer_extra_hosts(i, hosts)` | `/etc/hosts` entries for one container |
+| `extra_hosts_all(hosts)` | `/etc/hosts` entries for every container |
+
+Notes:
+
+- Indices count within the role: `peer_binary(0, ..)` is the first regular peer,
+  not the first node. (`peer_location` still uses the combined index.)
+- Host entries use Docker's `host:ip` form and are Docker NAT only; a
+  local-process network refuses them at build time.
+- Extra arguments are appended after the harness arguments, so a repeated flag
+  is parsed by the node's own CLI rules.
+- Overrides for a node that does not exist, or a malformed host entry, fail
+  `build()` instead of being ignored.
+- The default binary is resolved only if some node uses it, so a network where
+  every node is overridden never builds it.
+
 ## Remote Peer Support (SSH)
 
 **New in v0.2**: Spawn peers on remote Linux machines via SSH for realistic NAT/firewall testing.

@@ -1,6 +1,6 @@
 use crate::{
     binary::FreenetBinary,
-    docker::{DockerNatBackend, DockerNatConfig},
+    docker::{ContainerOptions, DockerNatBackend, DockerNatConfig},
     network::TestNetwork,
     peer::{get_free_port, TestPeer},
     process::{self, PeerProcess},
@@ -56,6 +56,21 @@ impl Default for Backend {
     }
 }
 
+/// Per-node overrides set through the builder.
+#[derive(Debug, Clone, Default)]
+struct NodeOverrides {
+    binary: Option<FreenetBinary>,
+    extra_args: Vec<String>,
+    extra_hosts: Vec<String>,
+}
+
+/// Identifies a node by role and by index within that role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NodeKey {
+    Gateway(usize),
+    Peer(usize),
+}
+
 struct GatewayInfo {
     address: String,
     public_key_path: PathBuf,
@@ -76,6 +91,9 @@ pub struct NetworkBuilder {
     max_connections: Option<usize>,
     start_stagger: Duration,
     backend: Backend,
+    node_overrides: HashMap<NodeKey, NodeOverrides>,
+    all_extra_args: Vec<String>,
+    all_extra_hosts: Vec<String>,
 }
 
 impl Default for NetworkBuilder {
@@ -100,6 +118,9 @@ impl NetworkBuilder {
             max_connections: None,
             start_stagger: Duration::from_millis(500),
             backend: Backend::default(),
+            node_overrides: HashMap::new(),
+            all_extra_args: Vec::new(),
+            all_extra_hosts: Vec::new(),
         }
     }
 
@@ -119,6 +140,192 @@ impl NetworkBuilder {
     pub fn binary(mut self, binary: FreenetBinary) -> Self {
         self.binary = binary;
         self
+    }
+
+    /// Use a different binary for one gateway (`index` counts gateways from 0).
+    ///
+    /// Nodes without an override use the binary set with [`binary`](Self::binary).
+    /// Useful for mixed-version tests.
+    pub fn gateway_binary(mut self, index: usize, binary: FreenetBinary) -> Self {
+        self.overrides_mut(NodeKey::Gateway(index)).binary = Some(binary);
+        self
+    }
+
+    /// Use a different binary for one regular peer (`index` counts regular
+    /// peers from 0, not counting gateways).
+    pub fn peer_binary(mut self, index: usize, binary: FreenetBinary) -> Self {
+        self.overrides_mut(NodeKey::Peer(index)).binary = Some(binary);
+        self
+    }
+
+    /// Append extra CLI arguments to one gateway's `freenet network` command line.
+    pub fn gateway_extra_args<I, S>(mut self, index: usize, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let o = self.overrides_mut(NodeKey::Gateway(index));
+        o.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Append extra CLI arguments to one regular peer's command line
+    /// (`index` counts regular peers from 0).
+    pub fn peer_extra_args<I, S>(mut self, index: usize, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let o = self.overrides_mut(NodeKey::Peer(index));
+        o.extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Append extra CLI arguments to every node's command line, before any
+    /// per-node arguments.
+    pub fn extra_args_all<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.all_extra_args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add `/etc/hosts` entries to one gateway container. Each entry is in
+    /// Docker's `host:ip` form, e.g. `"github.com:127.0.0.1"`.
+    /// Docker NAT backend only; a local-process network rejects it at build time.
+    pub fn gateway_extra_hosts<I, S>(mut self, index: usize, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let o = self.overrides_mut(NodeKey::Gateway(index));
+        o.extra_hosts.extend(hosts.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add `/etc/hosts` entries to one regular peer container
+    /// (`index` counts regular peers from 0). Docker NAT backend only.
+    pub fn peer_extra_hosts<I, S>(mut self, index: usize, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let o = self.overrides_mut(NodeKey::Peer(index));
+        o.extra_hosts.extend(hosts.into_iter().map(Into::into));
+        self
+    }
+
+    /// Add `/etc/hosts` entries to every node container (`host:ip` form).
+    /// Docker NAT backend only.
+    pub fn extra_hosts_all<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.all_extra_hosts
+            .extend(hosts.into_iter().map(Into::into));
+        self
+    }
+
+    fn overrides_mut(&mut self, key: NodeKey) -> &mut NodeOverrides {
+        self.node_overrides.entry(key).or_default()
+    }
+
+    fn node_key(is_gateway: bool, index: usize) -> NodeKey {
+        if is_gateway {
+            NodeKey::Gateway(index)
+        } else {
+            NodeKey::Peer(index)
+        }
+    }
+
+    /// Extra CLI args for a node: the all-node args, then the node's own.
+    fn extra_args_for(&self, key: NodeKey) -> Vec<String> {
+        let mut args = self.all_extra_args.clone();
+        if let Some(o) = self.node_overrides.get(&key) {
+            args.extend(o.extra_args.iter().cloned());
+        }
+        args
+    }
+
+    /// Extra `/etc/hosts` entries for a node: the all-node entries, then the node's own.
+    fn extra_hosts_for(&self, key: NodeKey) -> Vec<String> {
+        let mut hosts = self.all_extra_hosts.clone();
+        if let Some(o) = self.node_overrides.get(&key) {
+            hosts.extend(o.extra_hosts.iter().cloned());
+        }
+        hosts
+    }
+
+    fn has_extra_hosts(&self) -> bool {
+        !self.all_extra_hosts.is_empty()
+            || self
+                .node_overrides
+                .values()
+                .any(|o| !o.extra_hosts.is_empty())
+    }
+
+    /// Reject overrides that point at nodes that do not exist and malformed
+    /// host entries, so a typo fails the build instead of being ignored.
+    fn validate_overrides(&self) -> Result<()> {
+        for key in self.node_overrides.keys() {
+            let (role, index, count) = match *key {
+                NodeKey::Gateway(i) => ("gateway", i, self.gateways),
+                NodeKey::Peer(i) => ("peer", i, self.peers),
+            };
+            if index >= count {
+                return Err(Error::PeerStartupFailed(format!(
+                    "per-node override for {role} {index}, but the network has {count} {role}(s)"
+                )));
+            }
+        }
+        let all_hosts = self
+            .all_extra_hosts
+            .iter()
+            .chain(self.node_overrides.values().flat_map(|o| &o.extra_hosts));
+        for host in all_hosts {
+            match host.split_once(':') {
+                Some((name, ip)) if !name.is_empty() && !ip.is_empty() => {}
+                _ => {
+                    return Err(Error::PeerStartupFailed(format!(
+                        "invalid extra host entry {host:?}, expected \"host:ip\""
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the binary for every node. The default binary is resolved only
+    /// if some node uses it, so a fully overridden network never builds it.
+    fn resolve_binaries(&self) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+        let mut default_path: Option<PathBuf> = None;
+        let mut resolve = |key: NodeKey| -> Result<PathBuf> {
+            match self
+                .node_overrides
+                .get(&key)
+                .and_then(|o| o.binary.as_ref())
+            {
+                Some(binary) => binary.resolve(),
+                None => match &default_path {
+                    Some(path) => Ok(path.clone()),
+                    None => {
+                        let path = self.binary.resolve()?;
+                        default_path = Some(path.clone());
+                        Ok(path)
+                    }
+                },
+            }
+        };
+        let gateways = (0..self.gateways)
+            .map(|i| resolve(NodeKey::Gateway(i)))
+            .collect::<Result<Vec<_>>>()?;
+        let peers = (0..self.peers)
+            .map(|i| resolve(NodeKey::Peer(i)))
+            .collect::<Result<Vec<_>>>()?;
+        Ok((gateways, peers))
     }
 
     /// Set minimum connectivity ratio required (0.0 to 1.0)
@@ -195,6 +402,7 @@ impl NetworkBuilder {
 
     /// Build and start the network (async)
     pub async fn build(self) -> Result<TestNetwork> {
+        self.validate_overrides()?;
         match self.backend.clone() {
             Backend::Local => self.build_local().await,
             Backend::DockerNat(config) => self.build_docker_nat(config).await,
@@ -203,7 +411,12 @@ impl NetworkBuilder {
 
     /// Build network using local processes (original implementation)
     async fn build_local(self) -> Result<TestNetwork> {
-        let binary_path = self.binary.resolve()?;
+        if self.has_extra_hosts() {
+            return Err(Error::PeerStartupFailed(
+                "extra hosts are only supported by the Docker NAT backend".to_string(),
+            ));
+        }
+        let (gateway_binaries, peer_binaries) = self.resolve_binaries()?;
 
         tracing::info!(
             "Starting test network: {} gateways, {} peers",
@@ -220,8 +433,8 @@ impl NetworkBuilder {
 
         // Start gateways first
         let mut gateways = Vec::new();
-        for i in 0..self.gateways {
-            let peer = match self.start_peer(&binary_path, i, true, &run_root).await {
+        for (i, gateway_binary) in gateway_binaries.iter().enumerate() {
+            let peer = match self.start_peer(gateway_binary, i, true, &run_root).await {
                 Ok(peer) => peer,
                 Err(err) => {
                     let detail = format!("failed to start gateway {i}: {err}");
@@ -246,10 +459,10 @@ impl NetworkBuilder {
 
         // Start regular peers
         let mut peers = Vec::new();
-        for i in 0..self.peers {
+        for (i, peer_binary) in peer_binaries.iter().enumerate() {
             let peer = match self
                 .start_peer_with_gateways(
-                    &binary_path,
+                    peer_binary,
                     i + self.gateways,
                     false,
                     &gateway_info,
@@ -518,6 +731,13 @@ impl NetworkBuilder {
             args.push(max_conn.to_string());
         }
 
+        let role_index = if is_gateway {
+            index
+        } else {
+            index - self.gateways
+        };
+        args.extend(self.extra_args_for(Self::node_key(is_gateway, role_index)));
+
         // Spawn process (local or remote)
         let process: Box<dyn PeerProcess + Send> = match &location {
             PeerLocation::Local => Box::new(process::spawn_local_peer(
@@ -563,7 +783,7 @@ impl NetworkBuilder {
 
     /// Build network using Docker containers with NAT simulation
     async fn build_docker_nat(self, config: DockerNatConfig) -> Result<TestNetwork> {
-        let binary_path = self.binary.resolve()?;
+        let (gateway_binaries, peer_binaries) = self.resolve_binaries()?;
 
         tracing::info!(
             "Starting Docker NAT test network: {} gateways, {} peers",
@@ -599,7 +819,7 @@ impl NetworkBuilder {
 
         // Start gateways first
         let mut gateways = Vec::new();
-        for i in 0..self.gateways {
+        for (i, gateway_binary) in gateway_binaries.iter().enumerate() {
             let data_dir = create_peer_dir(&run_root, &format!("gw{}", i))?;
 
             // Generate keypair locally
@@ -608,14 +828,18 @@ impl NetworkBuilder {
             generate_keypair(&keypair_path, &public_key_path)?;
 
             let (info, process) = docker_backend
-                .create_gateway(
+                .create_gateway_with_options(
                     i,
-                    &binary_path,
+                    gateway_binary,
                     &keypair_path,
                     &public_key_path,
                     ws_port,
                     network_port,
                     &run_root,
+                    &ContainerOptions {
+                        extra_args: self.extra_args_for(NodeKey::Gateway(i)),
+                        extra_hosts: self.extra_hosts_for(NodeKey::Gateway(i)),
+                    },
                 )
                 .await
                 .map_err(|e| {
@@ -652,7 +876,7 @@ impl NetworkBuilder {
 
         // Start regular peers (each behind its own NAT)
         let mut peers = Vec::new();
-        for i in 0..self.peers {
+        for (i, peer_binary) in peer_binaries.iter().enumerate() {
             let peer_index = i + self.gateways;
             let data_dir = create_peer_dir(&run_root, &format!("peer{}", peer_index))?;
 
@@ -678,9 +902,9 @@ impl NetworkBuilder {
             let gateway_public_key_path = gateway_info.first().map(|gw| gw.public_key_path.clone());
 
             let (info, process) = docker_backend
-                .create_peer(
+                .create_peer_with_options(
                     peer_index,
-                    &binary_path,
+                    peer_binary,
                     &keypair_path,
                     &public_key_path,
                     &gateways_toml_path,
@@ -688,6 +912,10 @@ impl NetworkBuilder {
                     ws_port,
                     network_port,
                     &run_root,
+                    &ContainerOptions {
+                        extra_args: self.extra_args_for(NodeKey::Peer(i)),
+                        extra_hosts: self.extra_hosts_for(NodeKey::Peer(i)),
+                    },
                 )
                 .await
                 .map_err(|e| {
@@ -919,4 +1147,186 @@ fn dump_recent_logs(network: &TestNetwork) -> Result<()> {
 
 fn preserve_network_state(network: &TestNetwork) -> Result<PathBuf> {
     Ok(network.run_root().to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal self-cleaning temp dir, to avoid a new dev-dependency.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "freenet-test-network-{}-{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+
+        /// Create an empty file that stands in for a freenet binary.
+        fn fake_binary(&self, name: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, b"").unwrap();
+            path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn default_builder_has_no_overrides() {
+        let b = NetworkBuilder::new().gateways(1).peers(2);
+        assert!(b.validate_overrides().is_ok());
+        assert!(b.extra_args_for(NodeKey::Gateway(0)).is_empty());
+        assert!(b.extra_hosts_for(NodeKey::Peer(1)).is_empty());
+        assert!(!b.has_extra_hosts());
+    }
+
+    #[test]
+    fn all_node_entries_precede_per_node_entries() {
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(2)
+            .extra_args_all(["--all"])
+            .peer_extra_args(1, ["--only-peer-1", "x"])
+            .extra_hosts_all(["github.com:127.0.0.1"])
+            .peer_extra_hosts(1, ["api.github.com:127.0.0.1"]);
+        assert_eq!(b.extra_args_for(NodeKey::Gateway(0)), ["--all"]);
+        assert_eq!(b.extra_args_for(NodeKey::Peer(0)), ["--all"]);
+        assert_eq!(
+            b.extra_args_for(NodeKey::Peer(1)),
+            ["--all", "--only-peer-1", "x"]
+        );
+        assert_eq!(
+            b.extra_hosts_for(NodeKey::Peer(0)),
+            ["github.com:127.0.0.1"]
+        );
+        assert_eq!(
+            b.extra_hosts_for(NodeKey::Peer(1)),
+            ["github.com:127.0.0.1", "api.github.com:127.0.0.1"]
+        );
+        assert!(b.has_extra_hosts());
+    }
+
+    #[test]
+    fn repeated_per_node_calls_accumulate() {
+        let b = NetworkBuilder::new()
+            .gateway_extra_args(0, ["--a"])
+            .gateway_extra_args(0, ["--b"]);
+        assert_eq!(b.extra_args_for(NodeKey::Gateway(0)), ["--a", "--b"]);
+    }
+
+    #[test]
+    fn gateway_and_peer_indices_are_independent() {
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(1)
+            .gateway_extra_args(0, ["--gw"])
+            .peer_extra_args(0, ["--peer"]);
+        assert_eq!(b.extra_args_for(NodeKey::Gateway(0)), ["--gw"]);
+        assert_eq!(b.extra_args_for(NodeKey::Peer(0)), ["--peer"]);
+    }
+
+    #[test]
+    fn out_of_range_override_is_rejected() {
+        let err = NetworkBuilder::new()
+            .gateways(1)
+            .peers(2)
+            .peer_extra_args(2, ["--x"])
+            .validate_overrides()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("peer 2"), "{err}");
+
+        let err = NetworkBuilder::new()
+            .gateways(1)
+            .peers(2)
+            .gateway_binary(1, FreenetBinary::Installed)
+            .validate_overrides()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gateway 1"), "{err}");
+    }
+
+    #[test]
+    fn malformed_host_entry_is_rejected() {
+        for bad in ["github.com", ":127.0.0.1", "github.com:"] {
+            let res = NetworkBuilder::new()
+                .gateways(1)
+                .gateway_extra_hosts(0, [bad])
+                .validate_overrides();
+            assert!(res.is_err(), "{bad:?} should be rejected");
+        }
+        assert!(NetworkBuilder::new()
+            .gateways(1)
+            .gateway_extra_hosts(0, ["github.com:127.0.0.1"])
+            .validate_overrides()
+            .is_ok());
+    }
+
+    #[test]
+    fn binaries_resolve_per_node_with_default_fallback() {
+        let dir = TempDir::new("resolve");
+        let default = dir.fake_binary("default");
+        let gw0 = dir.fake_binary("gw0");
+        let peer1 = dir.fake_binary("peer1");
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(3)
+            .binary(FreenetBinary::Path(default.clone()))
+            .gateway_binary(0, FreenetBinary::Path(gw0.clone()))
+            .peer_binary(1, FreenetBinary::Path(peer1.clone()));
+        let (gws, peers) = b.resolve_binaries().unwrap();
+        assert_eq!(gws, [gw0]);
+        assert_eq!(peers, [default.clone(), peer1, default]);
+    }
+
+    #[test]
+    fn default_binary_is_not_resolved_when_every_node_is_overridden() {
+        let dir = TempDir::new("allover");
+        let gw0 = dir.fake_binary("gw0");
+        let peer0 = dir.fake_binary("peer0");
+        // The default points at a missing file, so resolving it would fail.
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(1)
+            .binary(FreenetBinary::Path(dir.0.join("missing")))
+            .gateway_binary(0, FreenetBinary::Path(gw0))
+            .peer_binary(0, FreenetBinary::Path(peer0));
+        assert!(b.resolve_binaries().is_ok());
+    }
+
+    #[test]
+    fn missing_override_binary_is_an_error() {
+        let dir = TempDir::new("missing");
+        let default = dir.fake_binary("default");
+        let b = NetworkBuilder::new()
+            .gateways(1)
+            .peers(1)
+            .binary(FreenetBinary::Path(default))
+            .peer_binary(0, FreenetBinary::Path(dir.0.join("missing")));
+        assert!(b.resolve_binaries().is_err());
+    }
+
+    #[tokio::test]
+    async fn local_backend_rejects_extra_hosts() {
+        let res = NetworkBuilder::new()
+            .backend(Backend::Local)
+            .gateways(1)
+            .peers(0)
+            .extra_hosts_all(["github.com:127.0.0.1"])
+            .build()
+            .await;
+        let err = res.err().expect("must fail").to_string();
+        assert!(err.contains("Docker NAT"), "{err}");
+    }
 }
