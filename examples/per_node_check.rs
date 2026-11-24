@@ -9,11 +9,13 @@
 //! FREENET_OLD_BINARY=/path/to/older/freenet cargo run --example per_node_check
 //! ```
 //!
-//! Builds 1 gateway + 1 peer. The gateway runs the installed binary and the
-//! peer runs the other one, every container gets a `github.com` host entry,
-//! and the peer gets an extra CLI argument. It then checks from inside the
-//! containers that each one runs the binary configured for it, that the host
-//! entry and argument took effect, and that the mixed network formed.
+//! Builds 1 gateway + 2 peers. The default binary is the old one; the gateway
+//! and peer 1 run the installed (new) one and peer 0 keeps the default. Every
+//! container gets a `github.com` host entry, peer 0 alone gets another host
+//! entry, and peer 1 alone gets an extra CLI argument. It checks from inside
+//! the containers that each one runs exactly its configured binary, that the
+//! entries and argument appear only where configured, and that the mixed
+//! network formed.
 //!
 //! The command-line check reads `/proc/1/cmdline`, which assumes the
 //! container runs the node directly as PID 1 (no entrypoint wrapper).
@@ -73,20 +75,24 @@ async fn main() -> anyhow::Result<()> {
         new_sha != old_sha,
         "the two binaries are identical, so this check would prove nothing"
     );
-    println!("gateway binary {} sha256 {new_sha}", new_binary.display());
-    println!("peer binary    {} sha256 {old_sha}", old_binary.display());
+    println!("new binary {} sha256 {new_sha}", new_binary.display());
+    println!("old binary {} sha256 {old_sha}", old_binary.display());
 
     let config = DockerNatConfig::default();
     let prefix = config.name_prefix.clone();
 
+    // Default binary is the old one; the gateway and peer 1 override it with
+    // the new one. Peer 0 keeps the default. A mis-wired role or index runs the
+    // wrong binary and fails the checks below.
     let network = TestNetwork::builder()
         .gateways(1)
-        .peers(1)
-        .binary(FreenetBinary::Path(new_binary.clone()))
-        .gateway_binary(0, FreenetBinary::Path(new_binary))
-        .peer_binary(0, FreenetBinary::Path(old_binary))
+        .peers(2)
+        .binary(FreenetBinary::Path(old_binary))
+        .gateway_binary(0, FreenetBinary::Path(new_binary.clone()))
+        .peer_binary(1, FreenetBinary::Path(new_binary))
         .extra_hosts_all(["github.com:127.0.0.1"])
-        .peer_extra_args(0, ["--min-number-of-connections", "1"])
+        .peer_extra_hosts(0, ["only-peer0.example:127.0.0.1"])
+        .peer_extra_args(1, ["--min-number-of-connections", "1"])
         .backend(Backend::DockerNat(config))
         .require_connectivity(1.0)
         .connectivity_timeout(Duration::from_secs(120))
@@ -95,50 +101,52 @@ async fn main() -> anyhow::Result<()> {
         .await?;
     println!("mixed network formed (readiness check passed)");
 
-    // Container names use the combined index: the gateway is 0 and the first
-    // peer is 1, while the builder's per-node indices count within each role.
-    let gw = format!("{prefix}-gw-0");
-    let peer = format!("{prefix}-peer-1");
+    // Container names use the combined index (gateways first); the builder's
+    // per-node indices count within each role.
+    // (name, expected sha256, has peer-0-only host, has extra arg)
+    let nodes = [
+        (format!("{prefix}-gw-0"), &new_sha, false, false),
+        (format!("{prefix}-peer-1"), &old_sha, true, false),
+        (format!("{prefix}-peer-2"), &new_sha, false, true),
+    ];
 
-    let gw_running = running_sha256(&gw)?;
-    anyhow::ensure!(
-        gw_running == new_sha,
-        "{gw} runs {gw_running}, expected {new_sha}"
-    );
-    println!("{gw}: runs the configured gateway binary");
-    let peer_running = running_sha256(&peer)?;
-    anyhow::ensure!(
-        peer_running == old_sha,
-        "{peer} runs {peer_running}, expected {old_sha}"
-    );
-    println!("{peer}: runs the configured peer binary");
-
-    for container in [&gw, &peer] {
-        let version = docker_exec(container, &["/proc/1/exe", "--version"])?;
-        println!("{container}: {}", version.lines().next().unwrap_or(""));
-        let hosts = docker_exec(container, &["cat", "/etc/hosts"])?;
+    for (name, expected_sha, has_peer0_host, has_arg) in &nodes {
+        let running = running_sha256(name)?;
         anyhow::ensure!(
+            &running == *expected_sha,
+            "{name} runs {running}, expected {expected_sha}"
+        );
+        let version = docker_exec(name, &["/proc/1/exe", "--version"])?;
+        println!(
+            "{name}: runs the configured binary ({})",
+            version.lines().next().unwrap_or("")
+        );
+
+        let hosts = docker_exec(name, &["cat", "/etc/hosts"])?;
+        let has_host = |h: &str| {
             hosts
                 .lines()
-                .any(|l| l.contains("127.0.0.1") && l.contains("github.com")),
-            "{container}: /etc/hosts lacks the github.com entry:\n{hosts}"
+                .any(|l| l.contains("127.0.0.1") && l.contains(h))
+        };
+        anyhow::ensure!(
+            has_host("github.com"),
+            "{name}: /etc/hosts lacks github.com:\n{hosts}"
         );
-        println!("{container}: /etc/hosts has the github.com entry");
+        anyhow::ensure!(
+            has_host("only-peer0.example") == *has_peer0_host,
+            "{name}: per-node host entry present={}, expected {has_peer0_host}:\n{hosts}",
+            has_host("only-peer0.example")
+        );
+        println!("{name}: /etc/hosts entries as configured");
+
+        let cmdline = docker_exec(name, &["sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline"])?;
+        let present = cmdline.contains("--min-number-of-connections 1");
+        anyhow::ensure!(
+            present == *has_arg,
+            "{name}: extra arg present={present}, expected {has_arg}: {cmdline}"
+        );
+        println!("{name}: extra arg present={present} as configured");
     }
-
-    let cmdline = docker_exec(&peer, &["sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline"])?;
-    anyhow::ensure!(
-        cmdline.contains("--min-number-of-connections 1"),
-        "{peer}: command line lacks the extra arg: {cmdline}"
-    );
-    println!("{peer}: command line includes the extra arg: {cmdline}");
-
-    let gw_cmdline = docker_exec(&gw, &["sh", "-c", "tr '\\0' ' ' < /proc/1/cmdline"])?;
-    anyhow::ensure!(
-        !gw_cmdline.contains("--min-number-of-connections"),
-        "{gw}: extra arg leaked to the gateway: {gw_cmdline}"
-    );
-    println!("{gw}: command line has no extra arg (as expected)");
 
     println!("OK");
     drop(network);

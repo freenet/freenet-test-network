@@ -147,7 +147,9 @@ impl NetworkBuilder {
     /// Nodes without an override use the binary set with [`binary`](Self::binary).
     /// Useful for mixed-version tests. Prefer [`FreenetBinary::Path`]: the other
     /// variants build or look up a binary once per node that uses them. Not
-    /// supported on remote (SSH) nodes; `build()` returns an error for that.
+    /// supported on remote (SSH) nodes; `build()` returns an error for that
+    /// whatever the backend (conservative: a remote location is only used by
+    /// the local-process backend today, but the check does not depend on it).
     ///
     /// Container names use the combined index (gateways first), while the
     /// `*_binary`, `*_extra_args` and `*_extra_hosts` indices count within a role.
@@ -262,12 +264,27 @@ impl NetworkBuilder {
     /// Extra CLI args for the node at combined index `global_index` (gateways
     /// first, then regular peers), as the local backend numbers nodes.
     fn args_for_node(&self, global_index: usize, is_gateway: bool) -> Vec<String> {
+        self.extra_args_for(self.key_for_node(global_index, is_gateway))
+    }
+
+    /// The override key for the node at combined index `global_index`
+    /// (gateways first, then regular peers).
+    fn key_for_node(&self, global_index: usize, is_gateway: bool) -> NodeKey {
         let role_index = if is_gateway {
             global_index
         } else {
             global_index - self.gateways
         };
-        self.extra_args_for(Self::node_key(is_gateway, role_index))
+        Self::node_key(is_gateway, role_index)
+    }
+
+    /// Docker container options for the node at combined index `global_index`.
+    fn container_options_for(&self, global_index: usize, is_gateway: bool) -> ContainerOptions {
+        let key = self.key_for_node(global_index, is_gateway);
+        ContainerOptions {
+            extra_args: self.extra_args_for(key),
+            extra_hosts: self.extra_hosts_for(key),
+        }
     }
 
     /// Where the node at combined index `global_index` runs.
@@ -608,11 +625,7 @@ impl NetworkBuilder {
         run_root: &Path,
     ) -> Result<TestPeer> {
         // Get location for this peer
-        let location = self
-            .peer_locations
-            .get(&index)
-            .cloned()
-            .unwrap_or_else(|| self.default_location.clone());
+        let location = self.location_for(index);
 
         let id = if is_gateway {
             format!("gw{}", index)
@@ -885,10 +898,7 @@ impl NetworkBuilder {
                     ws_port,
                     network_port,
                     &run_root,
-                    &ContainerOptions {
-                        extra_args: self.extra_args_for(NodeKey::Gateway(i)),
-                        extra_hosts: self.extra_hosts_for(NodeKey::Gateway(i)),
-                    },
+                    &self.container_options_for(i, true),
                 )
                 .await
                 .map_err(|e| {
@@ -961,10 +971,7 @@ impl NetworkBuilder {
                     ws_port,
                     network_port,
                     &run_root,
-                    &ContainerOptions {
-                        extra_args: self.extra_args_for(NodeKey::Peer(i)),
-                        extra_hosts: self.extra_hosts_for(NodeKey::Peer(i)),
-                    },
+                    &self.container_options_for(peer_index, false),
                 )
                 .await
                 .map_err(|e| {
@@ -1279,6 +1286,29 @@ mod tests {
         assert_eq!(b.args_for_node(1, true), ["--gw1"]);
         assert_eq!(b.args_for_node(2, false), ["--peer0"]);
         assert_eq!(b.args_for_node(3, false), ["--peer1"]);
+    }
+
+    #[test]
+    fn container_options_follow_role_and_role_index() {
+        let b = NetworkBuilder::new()
+            .gateways(2)
+            .peers(2)
+            .gateway_extra_args(0, ["--gw0"])
+            .gateway_extra_args(1, ["--gw1"])
+            .peer_extra_args(0, ["--peer0"])
+            .peer_extra_args(1, ["--peer1"])
+            .gateway_extra_hosts(1, ["gw1.example:127.0.0.1"])
+            .peer_extra_hosts(0, ["peer0.example:127.0.0.1"]);
+        // Combined indices: 0,1 are gateways; 2,3 are peers 0,1.
+        let o = |global, gw| b.container_options_for(global, gw);
+        assert_eq!(o(0, true).extra_args, ["--gw0"]);
+        assert_eq!(o(1, true).extra_args, ["--gw1"]);
+        assert_eq!(o(2, false).extra_args, ["--peer0"]);
+        assert_eq!(o(3, false).extra_args, ["--peer1"]);
+        assert_eq!(o(1, true).extra_hosts, ["gw1.example:127.0.0.1"]);
+        assert!(o(0, true).extra_hosts.is_empty());
+        assert_eq!(o(2, false).extra_hosts, ["peer0.example:127.0.0.1"]);
+        assert!(o(3, false).extra_hosts.is_empty());
     }
 
     #[test]

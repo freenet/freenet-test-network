@@ -1876,11 +1876,58 @@ mod container_options_tests {
     }
 
     #[test]
-    fn cmds_unchanged_without_options() {
+    fn cmds_match_golden_vectors_without_options() {
         let gw = gateway_cmd(9000, 31337, Ipv4Addr::new(172, 20, 0, 10), &opts(&[], &[]));
-        assert_eq!(gw.last().map(String::as_str), Some("/config/keypair.pem"));
+        assert_eq!(
+            gw,
+            [
+                "/app/freenet",
+                "network",
+                "--data-dir",
+                "/data",
+                "--config-dir",
+                "/config",
+                "--ws-api-address",
+                "0.0.0.0",
+                "--ws-api-port",
+                "9000",
+                "--network-address",
+                "0.0.0.0",
+                "--network-port",
+                "31337",
+                "--public-network-address",
+                "172.20.0.10",
+                "--public-network-port",
+                "31337",
+                "--is-gateway",
+                "--skip-load-from-network",
+                "--transport-keypair",
+                "/config/keypair.pem",
+            ]
+        );
         let peer = peer_cmd(9000, 31337, &opts(&[], &[]));
-        assert_eq!(peer.last().map(String::as_str), Some("/config/keypair.pem"));
+        assert_eq!(
+            peer,
+            [
+                "/app/freenet",
+                "network",
+                "--data-dir",
+                "/data",
+                "--config-dir",
+                "/config",
+                "--ws-api-address",
+                "0.0.0.0",
+                "--ws-api-port",
+                "9000",
+                "--network-address",
+                "0.0.0.0",
+                "--network-port",
+                "31337",
+                "--skip-load-from-network",
+                "--transport-keypair",
+                "/config/keypair.pem",
+            ]
+        );
     }
 
     #[test]
