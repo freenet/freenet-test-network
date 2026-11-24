@@ -130,6 +130,73 @@ cargo run --example docker_nat
 PEER_COUNT=4 cargo run --example docker_nat
 ```
 
+## Per-Node Binaries, Arguments and Hosts
+
+By default one binary (set with `.binary(..)`) runs every node. For tests that
+mix versions, individual nodes can override the binary, add command-line
+arguments, and add `/etc/hosts` entries.
+
+```rust
+use freenet_test_network::{Backend, FreenetBinary, NetworkBuilder};
+use std::path::PathBuf;
+
+let network = NetworkBuilder::new()
+    .backend(Backend::DockerNat(Default::default()))
+    .gateways(1)
+    .peers(3)
+    // Default binary for nodes without an override.
+    .binary(FreenetBinary::Path(PathBuf::from("/bin/freenet-new")))
+    // Peer 1 runs an older release.
+    .peer_binary(1, FreenetBinary::Path(PathBuf::from("/bin/freenet-old")))
+    // Keep every node from reaching GitHub, so an older node does not
+    // take the auto-update path and replace the binary under test.
+    .extra_hosts_all(["github.com:127.0.0.1", "api.github.com:127.0.0.1"])
+    // Extra CLI arguments for a single node.
+    .peer_extra_args(2, ["--some-flag", "value"])
+    .build()
+    .await?;
+```
+
+| Method | Effect |
+|---|---|
+| `gateway_binary(i, bin)` / `peer_binary(i, bin)` | Binary for one node |
+| `gateway_extra_args(i, args)` / `peer_extra_args(i, args)` | Arguments appended to that node's `freenet network` command |
+| `extra_args_all(args)` | Arguments appended to every node, before per-node ones |
+| `gateway_extra_hosts(i, hosts)` / `peer_extra_hosts(i, hosts)` | `/etc/hosts` entries for one container |
+| `extra_hosts_all(hosts)` | `/etc/hosts` entries for every container |
+
+Notes:
+
+- Indices count within the role: `peer_binary(0, ..)` is the first regular peer,
+  not the first node. (`peer_location` still uses the combined index.) Docker
+  container names also use the combined index: with one gateway, regular peer 0
+  is the container `<prefix>-peer-1`.
+- Host entries use Docker's `host:ip` form (the value may be an IPv6 address or
+  `host-gateway`) and are Docker NAT only; a local-process network refuses them
+  at build time. Whitespace and empty parts are rejected.
+- Extra arguments are appended after the harness arguments. Do not repeat a
+  flag the harness already sets (`--min-number-of-connections` when you also
+  call `min_connections`, `--ws-api-port`, `--is-gateway`, and so on): the node
+  rejects the duplicate and fails at startup.
+- Use `FreenetBinary::Path` for per-node overrides. The other variants build or
+  look up a binary once per node that uses them.
+- Per-node binaries are not supported on remote (SSH) peers, because remote
+  deployment stores every binary under `bin/<file name>` and
+  `RemoteMachine::freenet_binary` replaces all of them. `build()` returns an
+  error for that combination.
+- Overrides for a node that does not exist, or a malformed host entry, fail
+  `build()` instead of being ignored.
+- The default binary is resolved only if some node uses it, so a network where
+  every node is overridden never builds it.
+
+`examples/per_node_check.rs` is a manual end-to-end check of these options.
+It needs Docker, a `freenet` on PATH (the gateway) and a second, different
+binary in `FREENET_OLD_BINARY` (the peer):
+`FREENET_OLD_BINARY=/path/to/older/freenet cargo run --example per_node_check`.
+It confirms from inside the containers which binary each one runs, the host
+entry, and the extra argument. Its command-line check reads
+`/proc/1/cmdline`, so it assumes the node is PID 1 (no entrypoint wrapper).
+
 ## Remote Peer Support (SSH)
 
 **New in v0.2**: Spawn peers on remote Linux machines via SSH for realistic NAT/firewall testing.
